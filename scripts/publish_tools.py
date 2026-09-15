@@ -11,6 +11,7 @@ public 仓库，此后每次更新及时推送保持版本一致，交付时附�
 
 子命令:
     init   创建公开仓库（默认 public；本规则不允许 private，故不提供 --private）
+           **幂等**：已存在且为 public 则跳过创建；已存在但 private 则 FAIL 并给改可见性指引
     push   推送本地文件到仓库（默认 dry-run，加 --apply 才真写；已存在文件带 sha 更新，幂等）
     verify 校验仓库为 public + 远端 blob sha 与本地一致（版本一致的机器判据）
 
@@ -202,6 +203,21 @@ def cmd_init(args) -> int:
         print("[ERROR] 创建仓库需要凭据：--token / GITHUB_TOKEN / GH_TOKEN / gh auth token")
         print("[HINT]  本机已登录 gh CLI 时无需额外配置；也可用 `gh auth login` 登录。")
         return 2
+    # 幂等前置：仓库已存在就不重复创建（旧版会在已存在时抛 422 并报 FAIL，与「幂等可重跑」口径冲突）
+    info, ierr = _repo_info(owner, name, token)
+    if info is not None:
+        url = info.get("html_url") or f"https://github.com/{owner}/{name}"
+        if info.get("private") is True:
+            print(f"[FAIL] 仓库 {owner}/{name} 已存在但为 **private** —— 规则要求 public。"
+                  f"到 {url}/settings 改可见性，或换仓库名。")
+            return 1
+        print(f"[OK] 仓库已存在且为 public，跳过创建（幂等）：{url}")
+        print(f"[OK] private={info.get('private')}（须为 False）")
+        return 0
+    if not ierr.startswith("仓库") or "不存在" not in ierr:
+        # 非 404 的查询失败（网络/权限）→ 不冒险去 POST，避免误建或误判
+        print(f"[FAIL] 建仓前无法确认仓库状态：{ierr}")
+        return 1
     body = {
         "name": name,
         "description": args.description or "ai-workflow 自研工具与技能的公开留痕仓库（源码同步 + 版本一致）",
@@ -220,7 +236,12 @@ def cmd_init(args) -> int:
         print(f"[OK] private={data.get('private')}（须为 False）")
         return 0
     if st == 422:
-        print(f"[FAIL] 创建失败（422）：仓库可能已存在 —— {err[:200]}")
+        # 竞态兜底：前置查询时不存在，POST 时已被创建（如并发执行）→ 复查后按幂等处理
+        info2, _ = _repo_info(owner, name, token)
+        if info2 is not None and info2.get("private") is not True:
+            print(f"[OK] 仓库已存在且为 public（并发建仓竞态），按幂等跳过：{info2.get('html_url')}")
+            return 0
+        print(f"[FAIL] 创建失败（422）：{err[:200]}")
     else:
         print(f"[FAIL] 创建失败（HTTP {st}）：{err[:300]}")
     return 1
@@ -353,7 +374,7 @@ def main() -> int:
     ap.add_argument("--branch", default=DEFAULT_BRANCH, help=f"目标分支（默认 {DEFAULT_BRANCH}）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("init", help="创建**公开**仓库（本规则不允许 private，故无 --private 选项）")
+    p = sub.add_parser("init", help="创建**公开**仓库（本规则不允许 private，故无 --private 选项）；幂等：已存在且 public 则跳过")
     p.add_argument("--name", help="仓库名（缺省用 --repo 的 NAME 部分）")
     p.add_argument("--description", help="仓库描述")
     p.add_argument("--apply", action="store_true", help="真正执行（默认 dry-run）")
