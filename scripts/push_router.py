@@ -396,6 +396,24 @@ def cmd_push(a) -> int:
     out("改动面：%s..%s" % (a.base, a.head))
     out("模式：%s" % mode)
     out("")
+    # ⚠️ 真写之前先查工作区是否干净 —— 这不是洁癖，是本轮真实事故换来的：
+    # 本体通道按 **commit 内容**推（git cat-file blob <rev>:<path>），工具通道按 **工作区文件**推
+    # （publish_tools.py --file <工作区路径>）。若工作区有未提交改动，两条通道就会推出**不同内容**，
+    # 同一文件在两仓 sha 不一致、公开仓里可能躺着已修好的 bug 的旧版本。
+    if a.apply and not a.allow_dirty:
+        dirty = [l for l in git(root, "status", "--porcelain").decode("utf-8").splitlines() if l.strip()]
+        if dirty:
+            out("[FAIL] 工作区存在未提交改动 → 两条通道可能推不同内容（阻塞推送）")
+            out("       本体通道按 commit 内容推、工具通道按工作区文件推，二者必须同源。")
+            for l in dirty[:12]:
+                out("         " + l)
+            if len(dirty) > 12:
+                out("         …（共 %d 项）" % len(dirty))
+            out("       请先 `git commit`，或显式加 --allow-dirty 承担该风险。")
+            if a.result_file:
+                Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+            return 1
+
     plan = build_plan(root, a.base, a.head)   # push 只支持 rev 模式：本体通道按 commit 范围推
     n_fail = print_plan(plan, out)
     if n_fail:
@@ -486,6 +504,8 @@ def main() -> int:
     pp.add_argument("--head", required=True)
     pp.add_argument("--apply", action="store_true", help="真正推送（默认 dry-run）")
     pp.add_argument("--allow-delete", action="store_true", help="允许本体通道删除远端文件")
+    pp.add_argument("--allow-dirty", action="store_true",
+                    help="允许工作区有未提交改动时仍推送（默认阻塞：两条通道会推不同内容）")
     pp.add_argument("--expect-remote", help="要求本体远端 HEAD 等于该 sha，否则 FAIL")
     pp.add_argument("--ontology-repo", default=ONTOLOGY_REPO)
     pp.add_argument("--ontology-branch", default=ONTOLOGY_BRANCH)
