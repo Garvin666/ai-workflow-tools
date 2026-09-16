@@ -372,7 +372,7 @@ def cmd_classify(a) -> int:
     else:
         out("[OK] 交叉校验 0 失败")
     if a.result_file:
-        Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+        save_result(a.result_file, lines, root)
     return 1 if n_fail else 0
 
 
@@ -382,8 +382,38 @@ def run(cmd: list[str]) -> int:
     return p.returncode
 
 
+def save_result(result_file: str | None, lines: list, root: Path) -> None:
+    """把摘要写入 `--result-file`。两条铁律（均由实机事故推出来，别改回去）：
+
+    ① 相对路径**以技能根为基准**解析。事故：`run()` 用 `cwd=scripts/` 调通道，而传给通道的
+       `--result-file tasks/…` 是相对路径 → 通道把日志写到 `scripts/tasks/…`（父目录不存在）
+       → 在**推送已成功之后**抛异常 → 退出码 1 → 分流器判定"本体通道失败"并中止工具通道，
+       **一次成功的推送被一个日志路径掩盖成失败**。故本函数在 cmd_push 入口就把路径解析成
+       绝对路径，既用于自己写盘，也用于传给通道。
+    ② 落盘失败**绝不能改变推送结论** —— 日志是旁证，不是动作。写不出来就 WARN。
+    """
+    if not result_file:
+        return
+    p0 = Path(result_file)
+    p = (root / p0 if not p0.is_absolute() else p0).resolve()
+    try:
+        p.relative_to(root.resolve())
+    except ValueError:
+        print("[WARN] 结果路径越出技能根，拒绝写入（不影响推送结论）：%s" % p)
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as e:
+        print("[WARN] 结果落盘失败（不影响推送结论）：%s —— %s" % (p, e))
+
+
 def cmd_push(a) -> int:
     root = find_root(a.root)
+    # 统一解析为绝对路径（见 save_result 的事故说明）
+    if a.result_file:
+        rf = Path(a.result_file)
+        a.result_file = str(rf if rf.is_absolute() else (root / rf))
     lines: list[str] = []
 
     def out(s=""):
@@ -411,7 +441,7 @@ def cmd_push(a) -> int:
                 out("         …（共 %d 项）" % len(dirty))
             out("       请先 `git commit`，或显式加 --allow-dirty 承担该风险。")
             if a.result_file:
-                Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+                save_result(a.result_file, lines, root)
             return 1
 
     plan = build_plan(root, a.base, a.head)   # push 只支持 rev 模式：本体通道按 commit 范围推
@@ -420,7 +450,7 @@ def cmd_push(a) -> int:
         code_summary = "[FAIL] 交叉校验 %d 项失败 → 阻塞推送（规则：先补齐标注与登记再推）" % n_fail
         out(code_summary)
         if a.result_file:
-            Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+            save_result(a.result_file, lines, root)
         return 1
 
     py = sys.executable
@@ -445,7 +475,7 @@ def cmd_push(a) -> int:
         rc = 1
         out("[FAIL] 本体通道失败/阻塞 → 不再继续自研工具通道（避免半推送状态扩大）")
         if a.result_file:
-            Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+            save_result(a.result_file, lines, root)
         return rc
 
     # ---- 通道 2：自研工具 ----
@@ -478,7 +508,7 @@ def cmd_push(a) -> int:
     else:
         out("[FAIL] 存在失败通道，详见上方输出。")
     if a.result_file:
-        Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+        save_result(a.result_file, lines, root)
     return rc
 
 
