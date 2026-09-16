@@ -519,7 +519,7 @@ def main() -> int:
 
     # ---------- 判据 5：发布物自证 ----------
     print("")
-    print("-- 判据 5：发布物自证（远端 SKILL.md）--")
+    print("-- 判据 5：发布物自证（远端 SKILL.md 自身 + 它指向的下沉手册）--")
     try:
         lc = blob_of(rev, "SKILL.md").decode("utf-8", "replace")
     except RuntimeError:
@@ -539,11 +539,26 @@ def main() -> int:
     if rc and ver:
         rec("OK" if ("version: " + ver) in rc else "FAIL", "远端 SKILL.md 版本 = 期望",
             "命中 version: %s" % ver if ("version: " + ver) in rc else "远端内容里找不到 version: %s" % ver)
-        for kw, label in (("两类资源的分流推送路由", "分流推送小节"),
-                          ("冲突处理策略", "冲突处理策略"),
-                          ("触发条件", "触发条件"),
-                          ("selfbuilt: true", "自研标注（frontmatter）")):
-            rec("OK" if kw in rc else "FAIL", "远端 SKILL.md 含「%s」" % label)
+        # ⚠️ v3.4.0（P4+P5）：分流细则已由 SKILL.md 下沉到 `references/push-routing.md`，
+        # 变更日志已由 `ops.md` 拆到 `references/changelog.md`。判据随之**迁移到内容的新家** ——
+        # 而不是把关键词硬塞回 SKILL.md，那只会让判据退化成"为过门禁而保留的装饰"。
+        # 迁移口径：**只增不减**。SKILL.md 侧改查「是否还指着新家」（地址写错=断链，同样致命），
+        # 手册侧补查关键词，净判据数由 4 条升到 9 条 —— 验收器不得比门禁松。
+        probes = [
+            ("SKILL.md", ["selfbuilt: true", "references/push-routing.md", "references/changelog.md"]),
+            ("references/push-routing.md", ["两类资源的分流推送路由", "触发条件", "判定依据",
+                                            "冲突处理策略", "推送后的独立验收"]),
+        ]
+        for path, kws in probes:
+            try:
+                txt = base64.b64decode(
+                    api("repos/%s/contents/%s?ref=%s" % (a.repo, path, br_o))["content"]
+                ).decode("utf-8", "replace")
+            except (RuntimeError, ApiError) as e:
+                rec("FAIL", "远端 %s 可取" % path, str(e)[:120])
+                continue
+            for kw in kws:
+                rec("OK" if kw in txt else "FAIL", "远端 %s 含「%s」" % (path, kw))
 
     # ---------- 判据 7：两仓可见性 ----------
     print("")
