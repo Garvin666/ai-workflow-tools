@@ -16,9 +16,14 @@
 Git Data API：blob → tree(base_tree) → commit(parent=远端当前 HEAD) → PATCH ref。
 
 三个安全设计（都是踩过坑的结论，不是装饰）：
-  1. **默认 dry-run**：不加 `--apply` 绝不写远端。旧版 tmp/push_incremental.py 是
-     「不加 --dry-run 就真推」，与同族的 publish_tools.py（默认 dry-run）口径相反，
-     分流器无法安全包装两条命令 → v3.2.0 统一为默认 dry-run。
+  1. **默认 dry-run**：不加 `--apply` 绝不写远端 —— **包括不创建 blob**（v3.4.0 修正：
+     此前 blob 的 POST 落在 `if not a.apply` 判断**之前**，于是 dry-run 也会往远端 POST
+     一堆 blob。它们只是悬挂对象、不动 ref，破坏性为零，但"绝不写远端"这句话就成了假的，
+     且 32 项改动要 POST 29 次，实测一次 dry-run 被拖到 **2 分 37 秒**）。旧版
+     tmp/push_incremental.py 是「不加 --dry-run 就真推」，与同族的 publish_tools.py
+     （默认 dry-run）口径相反，分流器无法安全包装两条命令 → v3.2.0 统一为默认 dry-run。
+     ⚠️ 因此自证的「blob sha 比对」只在 `--apply` 时执行；dry-run 只报出**本地 sha**
+     （它由 `git rev-parse <rev>:<path>` 算出，本来就是权威值）。
   2. **删除保护**：远端删除不可逆，默认只列出待删项不执行，须显式 `--allow-delete`。
   3. **基线条校验**：`--expect-remote <sha>` 要求远端 HEAD 等于该值，否则 FAIL ——
      防「基于过时基线推送」。并发保护另有天然一道：commit 的 parent 取远端当前 HEAD，
@@ -209,17 +214,27 @@ def main() -> int:
             n_reuse += 1
             out("  [写] %s\n        复用远端已有 blob  %s" % (rel, blob[:10]))
         else:
-            content = git(root, "cat-file", "blob", blob)
-            new_blob = json.loads(
-                gh("POST", "repos/%s/git/blobs" % a.repo,
-                   {"content": content.decode("utf-8"), "encoding": "utf-8"})
-            )["sha"]
-            if new_blob != blob:
-                raise RuntimeError(
-                    "blob sha 不符：path=%s local=%s remote=%s（疑似换行符/编码口径不一致）"
-                    % (rel, blob, new_blob))
             n_new += 1
-            out("  [写] %s\n        新建 blob  %s" % (rel, blob[:10]))
+            # ⚠️ blob 只在**真要推**的时候才创建（v3.4.0 修正）。
+            # 此前这段在 `if not a.apply` 分支**之前**执行，于是 dry-run 也会 POST 出去
+            # 一堆 blob —— 它们只是悬挂对象、不动 ref，**破坏性为零**，但本脚本文件头写着
+            # "不加 --apply 绝不写远端"，那句话就成了假的；而且 32 项改动要 POST 29 次，
+            # 实测把一次 dry-run 拖到 **2 分 37 秒**（`gh` 子进程单价 ≈130 ms 起，网络往返另算），
+            # 直接吃掉了工具的联调价值。**"只读"要么真只读，要么别叫 dry-run。**
+            if a.apply:
+                content = git(root, "cat-file", "blob", blob)
+                new_blob = json.loads(
+                    gh("POST", "repos/%s/git/blobs" % a.repo,
+                       {"content": content.decode("utf-8"), "encoding": "utf-8"})
+                )["sha"]
+                if new_blob != blob:
+                    raise RuntimeError(
+                        "blob sha 不符：path=%s local=%s remote=%s（疑似换行符/编码口径不一致）"
+                        % (rel, blob, new_blob))
+                out("  [写] %s\n        新建 blob  %s" % (rel, blob[:10]))
+            else:
+                out("  [写] %s\n        待新建 blob %s（dry-run 不创建；`--apply` 时才 POST）"
+                    % (rel, blob[:10]))
         items.append({"path": rel, "mode": "100644", "type": "blob", "sha": blob})
 
     for rel in deletes:
