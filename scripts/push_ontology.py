@@ -51,6 +51,35 @@ DEFAULT_REPO = os.environ.get("ONTOLOGY_REPO", "Garvin666/ai-workflow-skill")
 DEFAULT_BRANCH = os.environ.get("ONTOLOGY_BRANCH", "main")
 
 
+def save_result(result_file: str | None, lines: list, root: Path) -> None:
+    """把摘要写入 `--result-file`。两条铁律（都由实机事故推出来，别改回去）：
+
+    ① 相对路径**以 `--root`（技能根）为基准**解析，不随 cwd 走。事故：分流器用
+       `cwd=scripts/` 调本脚本，而 `--result-file tasks/…` 是相对路径 → 写到
+       `scripts/tasks/…`（父目录不存在）→ 抛异常。
+    ② 落盘失败**绝不能改变推送结论**。上述事故里 ref 已经更新成功，却因为写日志抛异常
+       而返回退出码 1 → 分流器据此判定「本体通道失败」并中止工具通道。**日志是旁证，
+       不是动作**：写不出来就 WARN，动作的结果照实返回。
+    """
+    if not result_file:
+        return
+    p0 = Path(result_file)
+    p = (root / p0 if not p0.is_absolute() else p0).resolve()
+    # 归一化后再判边界：`..` 会被折叠，越出技能根的路径一律拒绝 —— 否则一次误传
+    # `--result-file ../tasks/x` 就会在技能根之外**新建目录并写文件**（实测踩到，已清理）。
+    try:
+        p.relative_to(root.resolve())
+    except ValueError:
+        print("[WARN] 结果路径越出技能根，拒绝写入（不影响推送结论）：%s" % p)
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(lines), encoding="utf-8")
+        print("[落盘] %s" % p)
+    except OSError as e:
+        print("[WARN] 结果落盘失败（不影响推送结论）：%s —— %s" % (p, e))
+
+
 def find_root(hint: str | None) -> Path:
     """定位本地 git 根。不要硬编码 parents[N] —— 脚本在 tmp/ 与 scripts/ 下层级不同，
     上一版就因硬编码层级而在移动位置后失效。"""
@@ -156,7 +185,7 @@ def main() -> int:
             % (a.expect_remote[:10], remote_head[:10]))
         out("       说明远端在两次推送之间被改动过（并发或他人推送）→ 请先人工核对再决定基线。")
         if a.result_file:
-            Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+            save_result(a.result_file, lines, root)
         return 1
 
     tree = json.loads(gh("GET", "repos/%s/git/trees/%s?recursive=1" % (a.repo, base_tree)))
@@ -213,14 +242,14 @@ def main() -> int:
         out("")
         out("DRY-RUN 结束：未创建 commit、未改 ref。加 --apply 才真推。")
         if a.result_file:
-            Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+            save_result(a.result_file, lines, root)
         return 0
 
     # ---- 4. 建 tree / commit / 改 ref ----
     if not items:
         out("无改动可推，跳过。（远端保持 %s）" % remote_head[:10])
         if a.result_file:
-            Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
+            save_result(a.result_file, lines, root)
         return 0
 
     new_tree = json.loads(
@@ -237,8 +266,7 @@ def main() -> int:
     out("新 commit = %s" % new_commit)
     out("ref %s 已更新：%s → %s" % (a.branch, remote_head[:10], new_commit[:10]))
     if a.result_file:
-        Path(a.result_file).write_text("\n".join(lines), encoding="utf-8")
-        print("[落盘] %s" % a.result_file)
+        save_result(a.result_file, lines, root)
     return 0
 
 
