@@ -82,6 +82,12 @@ except ImportError:  # pragma: no cover
 sys.stdout.reconfigure(encoding="utf-8")
 
 SK = Path(__file__).resolve().parents[1]          # 技能根，由脚本位置推导，不硬编码
+# 本地 git 根：默认与技能根同一个目录，由 `--skill-dir` 改写。
+# ⚠️ v3.4.0 补的是**功能缺口，不是放松判据**：此前 `--skill-dir` 只喂给 `read_registrations()`，
+# 而 `git()` 把 `cwd` 硬编码成 `SK` —— 于是「指定技能根来验收」这句话在文档上成立、实现上不成立。
+# 后果不是"少检了点"，而是**混合仓的根本局限**：`ai-workflow-skill` 同时接受两条本地来源
+# （技能根 + 工作区档案），要分别验收就必须能让 git 换根，否则工作区那一侧**根本无法被本脚本验收**。
+GIT_ROOT: Path = SK
 DEFAULT_ONTOLOGY = os.environ.get("ONTOLOGY_REPO", "Garvin666/ai-workflow-skill")
 DEFAULT_TOOLS = os.environ.get("SELFTOOL_REPO", "Garvin666/ai-workflow-tools")
 TEXT_EXT = {".py", ".md", ".yaml", ".yml", ".json", ".ps1", ".txt", ".csv", ".html", ".toml", ".cfg", ".ini"}
@@ -122,7 +128,7 @@ class ApiError(RuntimeError):
 # ---------------------------------------------------------------- 取数（本地 git / 远端 API）
 def git(*args: str) -> bytes:
     p = subprocess.run(["git", "-c", "core.quotePath=false", *args],
-                       cwd=str(SK), capture_output=True)
+                       cwd=str(GIT_ROOT), capture_output=True)
     if p.returncode:
         raise RuntimeError(p.stderr.decode("utf-8", "replace").strip()[:300])
     return p.stdout
@@ -368,7 +374,9 @@ def main() -> int:
     ap.add_argument("--prev-remote", default=None, help="推送**前**的远端 HEAD —— 用于证明远端独有项早于本次推送")
     ap.add_argument("--repo", default=DEFAULT_ONTOLOGY, help="本体仓（默认 %s）" % DEFAULT_ONTOLOGY)
     ap.add_argument("--tools-repo", default=DEFAULT_TOOLS, help="工具仓（默认 %s）" % DEFAULT_TOOLS)
-    ap.add_argument("--skill-dir", default=str(SK), help="技能根（默认由脚本位置推导）")
+    ap.add_argument("--skill-dir", default=str(SK),
+                    help="技能根，同时用作**本地 git 根**（默认由脚本位置推导）。"
+                         "混合仓有两条本地来源时，用本参数切到另一条（如工作区档案根）分别验收")
     ap.add_argument("--expect-version", default=None, help="期望版本号（默认从本地 rev 的 SKILL.md 自动推导）")
     ap.add_argument("--allow-dirty", action="store_true", help="放行工作区未提交改动（默认阻塞）")
     a = ap.parse_args()
@@ -376,10 +384,15 @@ def main() -> int:
     root = Path(a.skill_dir).resolve()
     rev = a.rev
 
+    # `--skill-dir` 同时也是**本地 git 根**（见 GIT_ROOT 处说明）。
+    # 不指定时 root == SK，行为与本参数加入前完全一致。
+    global GIT_ROOT
+    GIT_ROOT = root
+
     print("=== 推送结果 · 独立验收 ===")
     print("验收器：%s" % Path(__file__).name)
     print("零代码共享：不 import push_ontology.py / push_router.py / publish_tools.py")
-    print("本地 rev：%s    技能根：%s" % (rev, root))
+    print("本地 rev：%s    技能根（= 本地 git 根）：%s" % (rev, root))
     print("")
 
     # ---------- 判据 0：验收前提 ----------
@@ -523,7 +536,16 @@ def main() -> int:
     try:
         lc = blob_of(rev, "SKILL.md").decode("utf-8", "replace")
     except RuntimeError:
-        rec("FAIL", "本地 rev 含 SKILL.md", "找不到 SKILL.md，无法推导期望版本")
+        # 本条判据问的是「**期望版本能不能定下来**」，而不是「本地一定有 SKILL.md」。
+        # 传了 `--expect-version` 时期望版本已由参数给出，本地 SKILL.md 只是推导的**手段**，
+        # 手段用不上不等于判据不成立 —— 故此时记 OK 并说明理由。
+        # ⚠️ 注意这不是放松：**不传 `--expect-version` 的默认路径行为完全不变**（仍 FAIL）。
+        # 这条修正随 `--skill-dir` 一起是必需的 —— 从工作区档案根验收时那里本就没有 SKILL.md。
+        if a.expect_version:
+            rec("OK", "期望版本已确定", "%s（来自 --expect-version；本地 rev 无 SKILL.md，未走推导）"
+                % a.expect_version)
+        else:
+            rec("FAIL", "本地 rev 含 SKILL.md", "找不到 SKILL.md，无法推导期望版本")
         lc = ""
     m = re.search(r"^version:\s*([0-9][^\s#]*)", lc, re.M)
     ver = a.expect_version or (m.group(1) if m else None)
