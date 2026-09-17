@@ -6,7 +6,7 @@
 #           ⚠️ 它只覆盖 references/security-guide.md 出站清单的**第 3/4 项**（内部绝对路径 / 本机主目录路径），
 #           **不覆盖**凭据特征、个人隐私、元数据、隐藏内容 —— 那些仍需人工逐项比对。
 # 作者：ai-workflow 自研（技能增强-ai-workflow-v3.5.0-2026-09-17，2026-09-17）
-# 仓库：待推送
+# 仓库：https://github.com/Garvin666/ai-workflow-tools
 """outbound_scan.py - 出站前扫描：本机绝对路径检测（ai-workflow v3.5.0 / P0-2）。
 
 为什么单独成文件、而不是把正则抄进每个推送脚本
