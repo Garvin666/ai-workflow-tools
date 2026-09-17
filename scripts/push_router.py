@@ -70,6 +70,10 @@ except ImportError:  # pragma: no cover
 
 MARKERS = ("[自研工具]", "[自研技能]")
 HEADER_KEYS = ("用途", "适用场景", "作者", "仓库")
+# 自研标注头**只认代码脚本**；文档类一律不参与（理由见 scan_selftool_header 内的注释）。
+# 与 `scripts/checks.py` 的 `CODE_EXT` 取值必须保持一致 —— 两处判据不一致本身就是本技能
+# 点名过的病灶，而这里正是"A 处收窄了、B 处没收窄"会立刻造成矛盾结论的场景。
+CODE_EXT = (".py", ".ps1", ".sh", ".bat", ".js", ".ts")
 
 ONTOLOGY_REPO = os.environ.get("ONTOLOGY_REPO", "Garvin666/ai-workflow-skill")
 ONTOLOGY_BRANCH = os.environ.get("ONTOLOGY_BRANCH", "main")
@@ -77,6 +81,24 @@ TOOLS_REPO = os.environ.get("SELFTOOL_REPO", "Garvin666/ai-workflow-tools")
 TOOLS_BRANCH = os.environ.get("SELFTOOL_BRANCH", "main")
 
 HERE = Path(__file__).resolve().parent
+
+# ── P0-2（v3.5.0）：出站扫描（本机绝对路径）作为**推送前判据** ─────────────────
+# `security-guide.md` 的出站清单第 4 项要求"含用户名的主目录路径 → 换成相对路径或占位符"，
+# 而它此前一直是**纪律项**（无机器门禁）——诚实边界第 1 条写明"执行者可以漏项，流程不会自动拦"，
+# 之后该边界真的破了：v3.5.0 存量审计实测**会外发面 110 个文件**含本机绝对路径
+# （本体 13 / 档案 81 / 快照 16），证据见 `tasks/技能增强-ai-workflow-v3.5.0-2026-09-17/
+# 出站扫描-本机绝对路径-清单.md`。此处把它接上机器判据。
+#
+# 扫描器**单一实现**在 outbound_scan.py（不在此处复制正则：同一判据抄两份，正是本技能
+# 点名过的"零抽象层 + 复制粘贴"）。导入失败时**fail-closed**：宁可阻塞推送，也不静默放行 ——
+# 出站动作不可逆，这里不能有"扫描器没加载就当作没问题"的降级路径。
+try:
+    sys.path.insert(0, str(HERE))
+    import outbound_scan
+    _SCAN_ERR = ""
+except Exception as _e:  # noqa: BLE001 - 任何导入失败都必须转成显式阻塞，不裸抛
+    outbound_scan = None
+    _SCAN_ERR = "%s: %s" % (type(_e).__name__, _e)
 
 
 # --------------------------------------------------------------------------- #
@@ -151,14 +173,19 @@ def scan_selftool_header(path: Path) -> dict | None:
                     "作者": "", "仓库": repo_m.group(1).strip('"\'') if repo_m else "",
                     "标记行": 1}
 
-    # ⚠️ 文档类文件（.md）不进脚本分支。两个理由，缺一都会造成假阳性：
+    # ⚠️ 文档类文件不进脚本分支。两个理由，缺一都会造成假阳性：
     #   ① markdown 的 `#` 是**标题**不是注释 —— 把标题行当「注释行」判据本身就不成立；
     #   ② 本技能族**必须**在文档里写出标注示例（`references/push-routing.md` 的标注模板
     #      就是 `# [自研工具] xxx.py` 开头的代码块），于是「为说明格式而写出的标记字符串
     #      本身」会被判成「有标注头却未登记」→ FAIL 阻塞推送。
     #   修法是**收窄判据**，不是把文档改得躲开门禁 —— 躲避式修法会让人不敢在文档里引用这
     #   个标记（与 v3.1.1「文档引用完整性」同型）。技能包已由上面的 frontmatter 分支覆盖。
-    if path.suffix.lower() in (".md", ".markdown"):
+    # ⭐ v3.5.0 收窄：原先只排除 `.md`，**漏了 `.yaml`** —— 于是 `assets/plan-template.yaml`
+    #   字段注释里的一句 `[自研工具]` 同样被误判（实测：`checks.py plan` 出 WARN、
+    #   本脚本出**漏登记 FAIL**）。**同一条理由必须对整个文档类生效**，而不是只对上一次被
+    #   投诉的那个后缀生效 —— 按后缀逐个打补丁，就是等着下次换个后缀再犯一遍。
+    #   与 `scripts/checks.py` 的 `CODE_EXT`（只扫代码脚本）**刻意同口径、同收窄**。
+    if path.suffix.lower() not in CODE_EXT:
         return None
 
     # 脚本形式：前 40 行内的**注释行**。
@@ -292,6 +319,23 @@ def build_plan(skill_root: Path, base: str | None, head: str | None,
             checks.append(("WARN", rel, "技能根之外的文件 → 不属于本脚本管辖，请直接用 publish_tools.py"))
             continue
         ontology.append(rel)
+
+        # P0-2：出站前扫描（本机绝对路径）—— 命中即阻塞**两条通道**
+        if outbound_scan is None:
+            checks.append(("FAIL", rel, "出站扫描不可用（outbound_scan.py 导入失败：%s）"
+                                        "→ fail-closed 阻塞推送（出站动作不可逆，不允许静默放行）" % _SCAN_ERR))
+        else:
+            _hits = outbound_scan.scan_file(abs_p)
+            _f = [h for h in _hits if h["级别"] == "FAIL" and not h["豁免"]]
+            _wn = [h for h in _hits if h["级别"] == "WARN" and not h["豁免"]]
+            if _f:
+                checks.append(("FAIL", rel, "出站扫描命中**本机主目录路径**（出站清单第 4 项，第 %s 行）"
+                                            "→ 换成相对路径或占位符后再推：%s"
+                               % ("、".join(str(h["行号"]) for h in _f[:4]), _f[0]["片段"][:60])))
+            elif _wn:
+                checks.append(("WARN", rel, "出站扫描命中**本机盘符路径**（出站清单第 3 项，第 %s 行）"
+                                            "→ 本版只提示不阻断（边界已登记）：%s"
+                               % ("、".join(str(h["行号"]) for h in _wn[:4]), _wn[0]["片段"][:60])))
 
         hdr = scan_selftool_header(abs_p)
         hdr_map[rel] = hdr
