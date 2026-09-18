@@ -164,6 +164,24 @@ def self_test(report: Path) -> int:
         print(f"[无法判定] 方案书不存在: {report}")
         return 2
 
+    # ★ 2026-09-18 补：源头不完整时，**不能**输出“判据有问题”的结论。
+    #   实测踩到：改了生成器却没重推 ⇒ 发布校验探针报 4/5 ⇒ `UNAVAILABLE` 非空 ⇒
+    #   六个对照态**全部在比对之前**就被判 2 ⇒ 末尾打印
+    #   「✘ 判据有问题，不能声称方案书已验」。**归因又反了**：
+    #   判据没坏，是源头不完整。这与 `_report_data` / `verify_report` 的病**同型第三次**发作。
+    #   故此处判 **2（无法判定）**，不判 1 ——「无法判定」永远不等于「有问题」。
+    collect()
+    if MISSING or UNAVAILABLE:
+        print()
+        for m in MISSING:
+            print(f"  ✘ [源缺失] {m}")
+        for m in UNAVAILABLE:
+            print(f"  ✘ [环境缺失] {m} —— 换环境/联网/重推后重跑对应探针，再跑本对照")
+        print("阴性对照结论: [无法判定] 源头不完整 —— **不能**据此判“判据有问题”，"
+              "也**不能**声称方案书已验。")
+        print("  → 退出码 2（**不是通过**，也不是失败）。先把源头补齐。")
+        return 2
+
     code0, _ = verify(report)
     print(f"  [① 基线] 未改动方案书 → 退出码 {code0}（期望 0）")
 
