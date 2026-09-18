@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
 
-from _opt_data import collect, render, WORKSPACE, RECON, MISSING   # noqa: E402
+from _opt_data import collect, render, WORKSPACE, RECON, MISSING, UNAVAILABLE  # noqa: E402
 
 CSS = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -87,10 +87,17 @@ def main() -> int:
     args = ap.parse_args()
 
     data = collect()
-    if MISSING:
-        print(f"[拒绝出文档] 事实源缺失，退出码 2：{MISSING}")
+    # ★ 2026-09-18 补：UNAVAILABLE（环境能力缺失：缺依赖 / 缺网络 / 缺凭据）与 MISSING 同等对待。
+    #   只查 MISSING 的话，缺能力时不会拒绝出文档，而是**静默少写一个披露锚点**
+    #   —— 产出一份看起来完整、实则缺项的报告。
+    if MISSING or UNAVAILABLE:
+        print("[拒绝出文档] 源头不完整，退出码 2（**不是通过**）：")
+        for m in MISSING:
+            print(f"  ✘ [源缺失] {m}")
+        for m in UNAVAILABLE:
+            print(f"  ✘ [环境缺失] {m} —— 换环境/联网后重跑对应探针")
         print(f"  期望的盘点快照：{RECON}")
-        print("  先跑 tmp/collect_opt.py 重新盘点，再生成方案书。")
+        print("  先跑 tmp/collect_opt.py 重新盘点（必要时重跑 probe_judge_env / probe_publish），再生成方案书。")
         return 2
     V = render(data)
 
@@ -334,7 +341,7 @@ def main() -> int:
       '④ 事实源新增 <code>prop.patch.*.cum</code> / <code>prop.file.*</code> / <code>prop.fp_*</code> 等键。</p>')
     A(f'<p><b>验收判据</b>：文档锚点数由 12 升到 <b>52</b>；'
       f'「同一份 diff 被重复渲染 3 次」的次数 = <b>0</b>；'
-      f'校验器退出码 0 且阴性对照三态齐备（0/1/2）。</p>')
+      f'校验器退出码 0 且阴性对照<b>六态</b>齐备（0/1/2/2/2/1）。</p>')
     A('<p><b>风险与回滚</b>：低。改动只落在 <code>tasks/*/tmp/</code> 与生成的 HTML，'
       '可由生成器随时重建。</p></div>')
 
@@ -393,7 +400,7 @@ def main() -> int:
     A(f'<p><b>做什么</b>：新增 <code>tasks/README.md</code>，把 {S("b.n_task_dirs")} 个任务目录的'
       f'“有无确认表 / 有无 plan / 有无证据目录 / 文件数”列成矩阵。</p>')
     A('<p><b>怎么做</b>：<b>只标状态、不回填缺件</b>。对旧任务注明“当时未要求该件”；'
-      '缺 <code>plan.yaml</code> 的 {S("b.n_task_missing_plan")} 个中，'
+      f'缺 <code>plan.yaml</code> 的 {S("b.n_task_missing_plan")} 个中，'
       '若属进行中任务则补建空计划骨架，属已完成的就如实留白。</p>')
     A('<p><b>验收判据</b>：矩阵行数 = 任务目录数（{}</b>）；'
       '“当时未要求”的标注数 = 缺件数，不多不少；不出现任何新写入已完成任务的记录文件。</p>'
@@ -401,17 +408,34 @@ def main() -> int:
     A('<p><b>风险与回滚</b>：低。最大的风险是“手一滑就把缺件补齐” —— 那会污染审计痕迹，'
       '所以本条的验收判据里专门写了“不出现任何新写入”。</p></div>')
 
-    A('<div class="card"><h3><span class="pri p1">P1-3</span> 根目录一次性脚本归档（需你确认后执行）</h3>')
+    A('<div class="card"><h3><span class="pri p1">P1-3</span> 根目录一次性脚本归档（已执行）</h3>')
     A(f'<p><b>做什么</b>：把 {S("b.n_stray")} 个一次性脚本与探针输出（{S("b.stray_bytes")}）'
       f'<code>move</code> 到 <code>_archive/2026-09-18-根目录一次性脚本/</code>。</p>')
-    A('<p><b>怎么做</b>：<b>先出清单</b>（文件名 + 体量 + 归类），你确认后再 move；'
-      '一律 <code>move</code> 不删除；同时把 {S("b.n_root_md")} 个 <code>.md</code> 资料'
-      '登记进索引页而不是归档。</p>')
-    A(f'<p><b>验收判据</b>：根目录 <code>.py</code>/<code>.txt</code> 残留 = 0；'
-      f'<code>_archive/</code> 内文件数 = {S("b.n_stray")}；'
-      f'{S("b.n_unreg_dirs")} 个资产目录<b>一个都没动</b>。</p>')
+    A('<p><b>怎么做</b>：<b>先出清单</b>（文件名 + 体量 + 归类）交你确认，确认后一律 '
+      '<code>move</code> 不删除；同时把根目录 <code>.md</code> 资料登记进索引页而不是归档。</p>')
+    A(f'<p><b>结果</b>（{S("f.at")}）：移动 {S("f.n_moved")} 个文件（{S("f.kb_moved")}KB）到 '
+      f'<code>{S("f.target")}</code>，逐文件 sha256 前后一致。</p>')
+    A(f'<p><b>验收判据（3 组 × 6 项，全过）</b>：根目录 <code>.py</code>/<code>.txt</code> 残留 = '
+      f'{S("f.root_left")}；<code>_archive/</code> 内文件数 = {S("f.archive_count")}；'
+      f'{S("f.n_assets")} 个资产目录（共 {S("f.assets_mb")}MB）一个都没动：'
+      f'{S("f.assets_untouched")}。</p>')
     A('<p><b>风险与回滚</b>：中（移动批量文件）。回滚 = 从 <code>_archive/</code> move 回根目录，'
-      '文件内容零改动，因此可逆。⚠️ 本环境有批量删除守卫，脚本须用 <code>shutil.move</code> 并分批。</p></div>')
+      '文件内容零改动，因此可逆。⚠️ 本环境有批量删除守卫，脚本实际只用 <code>shutil.move</code>，'
+      '未调用 <code>os.remove</code>/<code>rmtree</code>。逐文件 sha256 留痕于 '
+      '<code>证据/05_归档执行记录.json</code>。</p></div>')
+
+    A('<div class="card"><h3><span class="pri p1">P1-4</span> 自研工具公开发布（已执行）</h3>')
+    A(f'<p><b>做什么</b>：把本轮自研的 {S("g.n_tools")} 个工具按“公开留痕”规则推到 '
+      f'<code>{S("g.repo")}</code>，并校验远端 blob sha 与本地一致。</p>')
+    A('<p><b>怎么做</b>：① 脚本首部补 <code>[自研工具]</code> 标注块（名称/用途/适用场景/'\
+      '作者/仓库四键）—— 本轮实测发现原工作区<b>零个文件</b>含该标注头，属“漏标注”；'
+      '② 走 <code>api.github.com</code>（本机 <code>github.com</code> 主域不通）；'
+      '③ 推送后逐文件比对远端 blob sha。</p>')
+    A(f'<p><b>验收判据</b>（{S("g.at")} 实测）：推送 {S("g.n_tools")} 个、验到 '
+      f'{S("g.n_verified")} 个、blob sha 全部一致：<b>{S("g.all_match")}</b>。'
+      f'逐文件 sha 与链接见 <code>证据/06_自研工具推送记录.json</code>。</p>')
+    A('<p><b>风险与回滚</b>：⚠️ <b>不可回滚</b> —— 公开仓一旦推送，第三方抓取/缓存可能已存在，'
+      '只能下线、无法真正撤回。因此本条<b>不在自动流程里</b>，必须拿到你的单独授权才执行。</p></div>')
 
     A('<div class="card"><h3><span class="pri p2">P2-1</span> 给历史无锚点产物补锚点或降级标注</h3>')
     A(f'<p><b>做什么</b>：对 {S("a.n_without_anchors")} 份无锚点 HTML：'
@@ -448,8 +472,8 @@ def main() -> int:
       '若多会话同时写，仍会超限 —— 那是机制问题，需要“单一写入者”约定，'
       '本轮只能做到“超限时可见”。</p></div>')
 
-    # ══════════════════════════════════════════════ 6 已执行 / 待确认
-    A('<h2>6. 本轮已执行 vs 待你确认</h2>')
+    # ══════════════════════════════════════════════ 6 已执行 / 待排期
+    A('<h2>6. 本轮已执行 vs 待排期</h2>')
     A('<table><thead><tr><th>项</th><th class="ctr">状态</th><th>留痕</th></tr></thead><tbody>')
     A('<tr><td>P0-1 哈希/指纹纳入锚点体系</td><td class="ctr"><span class="tag ok">已执行</span></td>'
       '<td><code>_report_data.py</code>、<code>gen_upgrade_doc.py</code>、本文档校验器</td></tr>')
@@ -463,28 +487,33 @@ def main() -> int:
       '<td><code>交付物索引.html</code></td></tr>')
     A('<tr><td>P1-2 任务目录完备性矩阵</td><td class="ctr"><span class="tag ok">已执行</span></td>'
       '<td><code>tasks/README.md</code></td></tr>')
-    A('<tr><td>P1-3 根目录一次性脚本归档</td>'
-      '<td class="ctr"><span class="tag no">待确认</span></td>'
-      '<td>清理清单：<code>证据/02_清理清单-待确认.md</code>（只列清单，未移动任何文件）</td></tr>')
+    A(f'<tr><td>P1-3 根目录一次性脚本归档</td><td class="ctr"><span class="tag ok">已执行</span></td>'
+      f'<td><code>_archive/2026-09-18-根目录一次性脚本/</code>（{S("f.n_moved")} 个）、'
+      f'<code>证据/02_清理清单-待确认.md</code>、<code>证据/05_归档执行记录.json</code></td></tr>')
+    A(f'<tr><td>P1-4 自研工具公开发布</td><td class="ctr"><span class="tag ok">已执行</span></td>'
+      f'<td><code>{S("g.repo")}</code>（{S("g.n_tools")} 个工具）、'
+      f'<code>证据/06_自研工具推送记录.json</code></td></tr>')
     A('<tr><td>P2-1 / P2-2 / P2-3</td><td class="ctr"><span class="tag">待排期</span></td>'
       '<td>本方案书 §5</td></tr>')
     A('</tbody></table>')
-    A('<div class="note"><b>为什么 P1-3 停下来等确认：</b>清理是批量移动文件，属高风险动作；'
+    A('<div class="note"><b>为什么 P1-3 当初要停下来等确认：</b>清理是批量移动文件，属高风险动作；'
       '而本次盘点已经证明“按名字定性”会把 2.3GB 资产误判成残留。'
-      '因此这条的执行前提就是<b>你先看清单</b>。</div>')
+      '因此这条的执行前提就是<b>先看清单</b>。'
+      '—— 你回复“归档，推”后已执行，结果与回滚方式见 P1-3 卡片与 证据/05。</div>')
 
     # ══════════════════════════════════════════════ 7 追溯
     A('<h2>7. 验证与追溯</h2>')
     A('<p>本文档每个数字都是 <code>data-key</code> 锚点，由 <code>tmp/_opt_data.py</code> '
-      '从两份快照 —— <code>证据/recon.json</code>（四域盘点）与 '
-      '<code>证据/03_判据环境探针.json</code>（判据环境实测）—— 现算；'
+      '从三份快照 —— <code>证据/recon.json</code>（四域盘点）、'
+      '<code>证据/03_判据环境探针.json</code>（判据环境实测）、'
+      '<code>证据/06_自研工具推送记录.json</code>（发布校验实测）—— 现算；'
       '<code>tmp/verify_opt_report.py</code> 会把它们从 HTML 解析回来逐一比对，'
-      '并配<b>六态</b>阴性对照：</p>')
+      '并配<b>七态</b>阴性对照：</p>')
     A('<div class="note"><b>这里刻意不复述「本次有多少处锚点」：</b>'
       '文档自身的锚点总数<b>在生成它的那一刻还没确定</b> —— 写死就会立刻过期。'
-      '实测：这一句原本写死为 141，而校验器现场数出的是 152 处 / 117 个去重 key：'
-      '数字既不对、又因为不是锚点而<b>永远不会被校验器抓到</b>。'
-      '处数由校验器现场打印，见 <code>tmp/verify_opt_out.txt</code>。</div>')
+      '实测过两次：写死的数与校验器现场数出的<b>不一致</b>（既不对、又因为不是锚点而'
+      '<b>永远不会被校验器抓到</b>）。所以处数只由校验器现场打印，见 '
+      '<code>tmp/verify_opt_out.txt</code>。</div>')
     A('<table><thead><tr><th>对照</th><th class="ctr">期望退出码</th><th>在测什么</th></tr></thead><tbody>')
     A('<tr><td>① 基线（文档不动）</td><td class="ctr">0</td><td>正常态必须通过</td></tr>')
     A('<tr><td>② 改一位数字</td><td class="ctr">1</td><td>校验器不是“永远返回 True”</td></tr>')
@@ -493,8 +522,10 @@ def main() -> int:
       '<td>“出现多于解析”这条解析率判据真的会触发</td></tr>')
     A('<tr><td>⑤ 换掉全部外层标签</td><td class="ctr">2</td>'
       '<td>“一个锚点都没解析到”这条绝对下限判据真的会触发</td></tr>')
-    A('<tr><td>⑥ 换到缺依赖的解释器（同一份脚本）</td><td class="ctr">2</td>'
-      '<td>「环境不对」不会伪装成「文档有错」—— 本条是收尾期真事故的<b>回归测试</b></td></tr>')
+    A('<tr><td>⑥ 把一处锚点改写成生成器源码片段</td><td class="ctr">1</td>'
+      '<td>“生成器漏了 f 前缀”这类<b>静默</b>缺陷能被抓到 —— 本条也是收尾期真事故的回归测试</td></tr>')
+    A('<tr><td>⑦ 换到缺依赖的解释器（同一份脚本）</td><td class="ctr">2</td>'
+      '<td>「环境不对」不会伪装成「文档有错」—— 同属收尾期真事故的<b>回归测试</b></td></tr>')
     A('</tbody></table>')
     # ⚠️ 下面这两段说明里**不能出现字面量** `data-key="` —— 那会被 ANY_KEY_RE 数成
     #    “出现但解析不到”的锚点，反而把校验器自己弄红（实测发生过，退出码 2）。
