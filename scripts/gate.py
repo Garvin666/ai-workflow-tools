@@ -50,6 +50,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -221,7 +222,26 @@ SELFTESTS = [
 
 
 def cmd_selftest() -> int:
-    base = Path.cwd()
+    # ⚠️ 本自检的 base **必须与 cwd 无关**，且**不得落在基础设施例外前缀内**。
+    #
+    # 曾经这里写 `base = Path.cwd()`，于是同一份代码树在不同工作目录下得出**相反结论**：
+    #   · cwd = 技能根（…/.workbuddy/skills/ai-workflow）时，4 项不符预期 ——
+    #     `../隔壁目录/a.md` 上跳后落进 `.workbuddy/skills/` ⇒ 判 INFRA 而非 OUTSIDE；
+    #     `<HOME>/.workbuddy/skills/ai-workflow/SKILL.md` 落进 base 之内 ⇒ 判 INSIDE 而非 INFRA；
+    #     决策层两项又由 INSIDE 派生（INSIDE 直接 ALLOW）⇒ 连带失败。
+    #   · cwd = 普通工作区时，6 项 fixture + 决策层全部符合预期。
+    # 即：**fixture 的期望值本就假定 base 是一处普通工作区**，而 cwd 是个不受控的变量。
+    # 自检自带一个确定的合成 base，才能保证"换台机器、换个目录跑，结论一样"。
+    #
+    # 生产路径**不受本改动影响**：`main()` 走 `Path(args.base)`（见下方 cmd_check），
+    # 从不用 cwd —— 即本次消除的是"自检环境依赖生产所没有的量"。
+    base = Path(tempfile.gettempdir()) / "aiwf-gate-selftest-base"
+    # 自证：合成 base 若恰好落在基础设施例外前缀内，本自检的 fixture 语义就不成立，
+    # 此时必须 fail-closed 报出来，而不是继续跑出一份看着正常的对照。
+    _infra_prefix = str(Path.home() / ".workbuddy" / "skills").replace("/", os.sep).lower()
+    if _infra_prefix in str(base).replace("/", os.sep).lower():
+        print("[FAIL-CLOSED] 自检 base 落在基础设施例外前缀内，fixture 语义不成立：%s" % base)
+        return 3
     home = str(Path.home())
     rules = None
     try:
