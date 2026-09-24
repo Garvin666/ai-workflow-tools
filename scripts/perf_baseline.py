@@ -35,14 +35,27 @@ import tempfile
 import time
 from pathlib import Path
 
-PY = r"C:\Users\26717\.workbuddy\binaries\python\envs\ai-workflow\Scripts\python.exe"
-SKILL = Path(r"C:\Users\26717\.workbuddy\skills\ai-workflow")
+# 解释器：显式环境变量优先，回退当前解释器（⚠️ 不得硬编码本机用户路径——出站清单第 4 项，v4.7.0 整理时修正）
+PY = os.environ.get("AIWF_PY") or sys.executable
+SKILL = Path(__file__).resolve().parent.parent
 CHECKS = SKILL / "scripts" / "checks.py"
 HTTP_FETCH = SKILL / "scripts" / "http_fetch.py"
-# 取一个真实存在、体量小的 plan.yaml 作 mark 基准（踩过的坑：伪造的 plan 会掩盖 BOM/缩进类缺陷）
-SAMPLE_PLAN = SKILL / "tasks" / "技能增强-ai-workflow-v3.2.1-2026-09-16" / "plan.yaml"
+
+
+def _find_sample_plan() -> Path:
+    # 取一个真实存在、体量小的 plan.yaml 作 mark 基准（踩过的坑：伪造的 plan 会掩盖 BOM/缩进类缺陷）。
+    # ⚠️ 勿硬编码任务目录名——archive_tasks.py 会把目录移进 tasks/_archive/，硬编码路径会静默失效
+    #（v4.7.0 仓库整理实测：v3.2.1 目录被归档后 SAMPLE_PLAN.exists() 恒 False，mark 测点静默跳过）。
+    tasks = SKILL / "tasks"
+    hits = sorted(tasks.glob("*/plan.yaml")) or sorted(tasks.glob("_archive/*/*/plan.yaml"))
+    if not hits:
+        return tasks / "_占位不存在" / "plan.yaml"   # 让 .exists() 判 False，走既有降级分支
+    return min(hits, key=lambda q: q.stat().st_size)
+
+
+SAMPLE_PLAN = _find_sample_plan()
 # v3.3.0 的 checks.py 备份：用于「同一棵树」的受控对照（见 m_checks_skill_old 的说明）
-BACKUP_CHECKS = SKILL / "_backup-v3.3.0" / "scripts" / "checks.v3.3.0.py"
+BACKUP_CHECKS = SKILL / "_archive" / "backups" / "_backup-v3.3.0" / "scripts" / "checks.v3.3.0.py"
 
 RUNS = 3
 
