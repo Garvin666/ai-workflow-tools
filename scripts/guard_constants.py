@@ -16,8 +16,13 @@
 
   ① **必须同源**（今天取值完全相同）—— 一旦某处被改动而另一处没跟上，就会出现
      "两个模块对同一物理量用两套判据"，这正是技能库卫生第 4 条要防的事。
-     例如 `RETRY_DELAYS`（ai_call / http_fetch）、`CODE_EXT`（checks / push_router）、
-     `REF_PATTERN`（archive_tasks / checks）、`SELFTOOL_KEYS`（checks / verify_push）。
+     例如 `RETRY_DELAYS`（ai_call / http_fetch）、`CODE_EXT`（checks_core / push_router）、
+     `REF_PATTERN`（archive_tasks / checks_core）、`SELFTOOL_KEYS`（checks_core / verify_push）。
+
+     ⚠️ 登记 `members` 时**必须写常量的定义处**，不能写转出它的入口模块。
+     v4.4.2 把 `checks.py` 拆成包后，`checks.py` 改用 `from checks_core import *` 转出常量 ——
+     星号导入在 AST 里**不产生 `Assign` 节点**，而本守卫正是按 AST 取数（`top_level_const`），
+     于是三组常量恒报 MISSING、守卫对它们**静默失能**（2026-09-22 修复，见 CHANGELOG v4.6.0）。
 
   ② **刻意不同**（语义不同，合并会改变行为）—— 例如 `TEXT_EXT` 中 verify_push 的是
      publish_tools 的真子集（少 `.ts`/`.tsv`/`.bat`/`.css`/`.gitignore`/`.js`/`.sh`）；
@@ -68,21 +73,26 @@ GROUPS = [
     {
         "name": "CODE_EXT",
         "policy": "eq",
-        "members": ["scripts/checks.py", "scripts/push_router.py"],
-        "why": "「什么算代码文件」在自检与分流推送的两侧必须是同一套判据",
+        "members": ["scripts/checks_core.py", "scripts/push_router.py"],
+        "why": "「什么算代码文件」在自检与分流推送的两侧必须是同一套判据。"
+               "登记处取 checks_core.py（**定义处**）而非 checks.py —— 后者自 v4.4.2 起"
+               "只以 `from checks_core import *` 转出，星号导入在 AST 里不产生 Assign 节点，"
+               "本守卫按 AST 取数会恒报『找不到模块级常量』（2026-09-22 修复）",
     },
     {
         "name": "REF_PATTERN",
         "policy": "eq",
-        "members": ["scripts/archive_tasks.py", "scripts/checks.py"],
-        "why": "「文档引用完整性」是扁平检查（反引号写裸文件名即命中），归档门禁与自检必须同形",
+        "members": ["scripts/archive_tasks.py", "scripts/checks_core.py"],
+        "why": "「文档引用完整性」是扁平检查（反引号写裸文件名即命中），归档门禁与自检必须同形。"
+               "登记处取 checks_core.py（定义处），理由同 CODE_EXT",
     },
     {
         "name": "SELFTOOL_KEYS",
         "policy": "eq",
-        "members": ["scripts/checks.py", "scripts/verify_push.py"],
+        "members": ["scripts/checks_core.py", "scripts/verify_push.py"],
         "why": "自研标注四项必填在自检与独立验收两侧须同源；此处只校验取值一致，"
-               "**不引入共享依赖**，verify_push.py 的独立性不受影响",
+               "**不引入共享依赖**，verify_push.py 的独立性不受影响。"
+               "登记处取 checks_core.py（定义处），理由同 CODE_EXT",
     },
     {
         "name": "TEXT_EXT",
@@ -151,7 +161,16 @@ def check_group(group, root=SKILL_ROOT, resolver=None):
         if resolver is not None:
             t = resolver((rel, name))
         else:
-            src = _read(os.path.join(root, rel.replace("/", os.sep)))
+            abspath = os.path.join(root, rel.replace("/", os.sep))
+            # 登记表有**两种**失效形态，都要报成 MISSING 而不是崩：
+            #   ① 文件不存在（路径写错 / 文件被移动或改名）
+            #   ② 文件在但常量不在（拆分后常量搬走、或改用星号导入转出）
+            # 实测（2026-09-22）：未处理 ① 时直接抛 FileNotFoundError + traceback，
+            # 退出码虽是 1（fail-closed），但输出不是可解析的判据结论，排查方向也被带偏。
+            if not os.path.exists(abspath):
+                return {"group": name, "policy": policy, "status": "MISSING",
+                        "detail": "登记的文件不存在：%s（登记表路径已失效）" % rel}
+            src = _read(abspath)
             _, t = top_level_const(src, name)
         if t is None:
             return {"group": name, "policy": policy, "status": "MISSING",
@@ -195,7 +214,7 @@ NEGATIVE = [
      "RETRY_DELAYS", {("scripts/ai_call.py", "RETRY_DELAYS"): repr([1, 2, 3]),
                       ("scripts/http_fetch.py", "RETRY_DELAYS"): repr([2, 4, 8])}),
     ("把 verify_push 的 SELFTOOL_KEYS 少一项",
-     "SELFTOOL_KEYS", {("scripts/checks.py", "SELFTOOL_KEYS"): repr(["名称", "用途", "适用场景", "仓库链接"]),
+     "SELFTOOL_KEYS", {("scripts/checks_core.py", "SELFTOOL_KEYS"): repr(["名称", "用途", "适用场景", "仓库链接"]),
                        ("scripts/verify_push.py", "SELFTOOL_KEYS"): repr(["名称", "用途"])}),
     ("把 verify_push 的 TEXT_EXT 扩到超出 publish_tools（打破子集）",
      "TEXT_EXT", {("scripts/publish_tools.py", "TEXT_EXT"): repr([".py", ".md"]),
@@ -211,6 +230,18 @@ def selftest():
     bad = 0
     for desc, gname, resolver in NEGATIVE:
         group = next(g for g in GROUPS if g["name"] == gname)
+        # 先自证夹具与登记表同步：resolver 必须覆盖该组全部 members。
+        # 否则 check_group 取不到值 → MISSING → 会被读成"对照未命中"，
+        # 而真实原因是**夹具过期**、不是判据失灵。
+        # 实测（2026-09-22）：改完 members 忘改本清单，--selftest 从 4/4 掉到 3/4，
+        # 报错文本是"在 X 中找不到模块级常量"—— 指向的是常量，真因却是夹具。
+        missing = [m for m in group["members"] if (m, gname) not in resolver]
+        if missing:
+            bad += 1
+            print("[FAIL] %s\n       ⚠️ 夹具与 GROUPS.members **不同步**：resolver 未覆盖 %s"
+                  "\n       （这是夹具过期，不是判据失灵 —— 改 members 后必须同步改 NEGATIVE）"
+                  % (desc, missing))
+            continue
         r = check_group(group, resolver=lambda k: resolver.get(k))
         hit = r["status"] == "DRIFT"
         bad += 0 if hit else 1
@@ -230,20 +261,27 @@ def main():
         return selftest()
 
     results = [check_group(g, root=a.root) for g in GROUPS]
-    drift = [r for r in results if r["status"] != "OK"]
+    bad = [r for r in results if r["status"] != "OK"]
+    # 三态分离：DRIFT（取值不一致）/ MISSING（登记表失效，**无法判定**）/ ERROR（未知 policy）
+    # 语义不同，不得合并成一个词上报。实测教训：原汇总语把三者统称"漂移 N 组"，
+    # 于是 3 组 MISSING 被读成"有 3 处取值不一致"，先去查取值差异 —— 方向完全错了。
+    counts = {s: sum(1 for r in results if r["status"] == s)
+              for s in ("OK", "DRIFT", "MISSING", "ERROR")}
 
     if a.json:
-        print(json.dumps({"drift": len(drift), "results": results},
+        # "drift" 键保留原义 = 非 OK 总数（向后兼容既有调用方）；细分见 by_status
+        print(json.dumps({"drift": len(bad), "by_status": counts, "results": results},
                          ensure_ascii=False, indent=1))
-        return 1 if drift else 0
+        return 1 if bad else 0
 
     print("=== 跨模块判据同源守卫（技能库卫生第 4 条）===")
     print("技能根：%s\n" % a.root)
     for r in results:
         mark = {"OK": "[ OK ]", "DRIFT": "[FAIL]", "MISSING": "[FAIL]", "ERROR": "[FAIL]"}[r["status"]]
         print("%s %-16s policy=%-7s %s" % (mark, r["group"], r["policy"], r["detail"][:160]))
-    print("\n=== 结果：%d 组，漂移 %d 组 ===" % (len(results), len(drift)))
-    return 1 if drift else 0
+    print("\n=== 结果：%d 组 —— OK %d / 漂移(DRIFT) %d / 登记失效(MISSING) %d / 错误(ERROR) %d ==="
+          % (len(results), counts["OK"], counts["DRIFT"], counts["MISSING"], counts["ERROR"]))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
