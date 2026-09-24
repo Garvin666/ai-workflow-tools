@@ -350,7 +350,9 @@ def annotate_check(entry: dict, rev: str, path: str) -> None:
         return
 
     pos = data.find(cl.strip()) if cl else 0
-    block = data[max(0, pos - 200): pos + 1200]
+    # frontmatter 分支（cl 为 None）：SKILL.md 的 description 很长，含「仓库：链接」的
+    # [自研技能] 头可能被挤出小窗口 → 对整份文件头部取大窗口（v4.7.0 仓库整理实测修正）。
+    block = data[max(0, pos - 200): pos + 1200] if cl else data[:6000]
     base = Path(path).name
     fm_name = re.search(r"^name:\s*(\S+)", data, re.M)
     has_name = (base in (cl or "")) or (name in (cl or "")) or bool(fm_name and fm_name.group(1) == name)
@@ -562,12 +564,12 @@ def main() -> int:
         rec("OK" if ("version: " + ver) in rc else "FAIL", "远端 SKILL.md 版本 = 期望",
             "命中 version: %s" % ver if ("version: " + ver) in rc else "远端内容里找不到 version: %s" % ver)
         # ⚠️ v3.4.0（P4+P5）：分流细则已由 SKILL.md 下沉到 `references/push-routing.md`，
-        # 变更日志已由 `ops.md` 拆到 `references/changelog.md`。判据随之**迁移到内容的新家** ——
+        # 演进台账：v3.x 拆到 `references/changelog.md`，v4.4.2 再移居 `_archive/changelog.md`（SKILL.md 第 18/506 行口径）。判据随之**迁移到内容的新家** ——
         # 而不是把关键词硬塞回 SKILL.md，那只会让判据退化成"为过门禁而保留的装饰"。
         # 迁移口径：**只增不减**。SKILL.md 侧改查「是否还指着新家」（地址写错=断链，同样致命），
         # 手册侧补查关键词，净判据数由 4 条升到 9 条 —— 验收器不得比门禁松。
         probes = [
-            ("SKILL.md", ["selfbuilt: true", "references/push-routing.md", "references/changelog.md"]),
+            ("SKILL.md", ["selfbuilt: true", "references/push-routing.md", "_archive/changelog.md"]),
             ("references/push-routing.md", ["两类资源的分流推送路由", "触发条件", "判定依据",
                                             "冲突处理策略", "推送后的独立验收"]),
         ]
