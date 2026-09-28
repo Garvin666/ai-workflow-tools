@@ -43,6 +43,7 @@ blob sha 自证：本地侧内容一律从 `git cat-file blob <rev>:<path>` 取�
 退出码: 0 = 成功（含 dry-run 与幂等跳过）；1 = 有 FAIL；2 = 用法/环境错误
 """
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -223,9 +224,18 @@ def main() -> int:
             # 直接吃掉了工具的联调价值。**"只读"要么真只读，要么别叫 dry-run。**
             if a.apply:
                 content = git(root, "cat-file", "blob", blob)
+                # ⚠️ 任务档案里可能混入二进制文件（PDF/图片等）—— 无脑 `.decode("utf-8")`
+                # 会在推送半途裸抛 UnicodeDecodeError（已 POST 的 blob 悬挂、ref 未动）。
+                # GitHub blobs API 支持 `encoding: base64`；无论走哪条路，下方
+                # `new_blob != blob` 的 sha 比对都是正确性的机器判据，不因编码路径而失效。
+                try:
+                    body = {"content": content.decode("utf-8"), "encoding": "utf-8"}
+                except UnicodeDecodeError:
+                    body = {"content": base64.b64encode(content).decode("ascii"),
+                            "encoding": "base64"}
+                    out("        （二进制内容，按 base64 编码上传）")
                 new_blob = json.loads(
-                    gh("POST", "repos/%s/git/blobs" % a.repo,
-                       {"content": content.decode("utf-8"), "encoding": "utf-8"})
+                    gh("POST", "repos/%s/git/blobs" % a.repo, body)
                 )["sha"]
                 if new_blob != blob:
                     raise RuntimeError(
