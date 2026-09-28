@@ -342,6 +342,35 @@ def _call_b(judge, state, base, timeout=600):
     return (out or None), r.returncode, err
 
 
+def _split_a_list(values):
+    """把 `--a` 的取值列表解析成 `[(judge|None, 取值), ...]`（v4.14.0 多 judge 支持）。
+
+    两种形式：**裸取值**（单 judge，靠 `--judge` 补键）与 **`judge=取值`**（自带键，可重复）。
+    ⚠️ **不允许混用** —— 混用时「哪条 --a 属于哪个 judge」全靠猜，而猜错会写出一条
+    judge 与 A 值错配的样本，**污染一致率分母且事后不可辨**（比报错坏得多）。
+    故一律 RecordError 交给调用方 fail-closed。
+    """
+    flags = [("=" in v) for v in values]
+    if any(flags) and not all(flags):
+        raise RecordError("--a 不得混用：要么全写 `judge=取值`，要么全写裸取值")
+    out = []
+    for v in values:
+        if "=" in v:
+            key, _, val = v.partition("=")
+            key = key.strip()
+            if key not in JUDGE_B_FIELD:
+                raise RecordError("--a 的键不是合法 judge：%s（可选 %s）"
+                                  % (key, "/".join(sorted(JUDGE_B_FIELD))))
+            if not val:
+                raise RecordError("--a %s= 的取值为空" % key)
+            out.append((key, val))
+        else:
+            if not v:
+                raise RecordError("--a 取值为空")
+            out.append((None, v))
+    return out
+
+
 def cmd_run(args):
     """一条命令完成采样：探活（同源）→ 跑 B 侧 → 与 `--a` 配对 → append。
 
@@ -355,9 +384,36 @@ def cmd_run(args):
          要进一致率分母只能走 `review --verdict user_spot_checked`（人工抽查）。
       ③ **不落原文**：`state` 只在内存里传给 B 侧，落盘只为 `state_sha1` 指纹
          （`--keep-state` 显式打开才落原文，默认关）。
+      ④ **可一次跑多个 judge**（v4.14.0）：`--a judge=取值` 可重复，各 judge **共用同一份
+         `--state`/`--state-file`** —— 判的是同一份输入，只是 A 侧取值语义各不同。
+         若各 judge 的输入本就不同，**分次调用**，不要硬塞进一次（那会把 state 与 judge 错配）。
     """
     le = _load_laya_ensure()
     base = args.base or le.lc.DEFAULT_BASE
+
+    # --- v4.14.0：先解析 --a 并判参数，**再做探活**（参数错就不该拉起服务）---
+    def _argfail(msg):
+        print(json.dumps({"ok": False, "stage": "args", "detail": msg},
+                         ensure_ascii=False, indent=2), file=sys.stderr)
+        return le.EXIT_MISCONFIG
+
+    try:
+        jobs = _split_a_list(list(args.a or []))
+    except RecordError as ex:
+        return _argfail(str(ex))
+    keyed = [j for j, _ in jobs if j]
+    if keyed and args.judge:
+        return _argfail("带键 --a 与 --judge 不得并用（前者已含 judge）")
+    if keyed:
+        pairs = jobs
+    else:
+        if not args.judge:
+            return _argfail("裸 --a 必须配 --judge；多 judge 请改用 `--a judge=取值`")
+        if len(jobs) != 1:
+            return _argfail("裸 --a 只允许给一次；多 judge 请改用带键形式")
+        pairs = [(args.judge, jobs[0][1])]
+    if args.id is not None and len(pairs) > 1:
+        return _argfail("多 judge 时 --id 不可手动指定（会撞 id；自动自增）")
     state = None
     if args.state_file:
         with open(args.state_file, "r", encoding="utf-8") as f:
@@ -388,33 +444,42 @@ def cmd_run(args):
         print("[run] 服务不可达 → 已拉起并就绪（%ss）：%s" % (elapsed, detail), file=sys.stderr)
 
     try:
-        raw, rc, err = _call_b(args.judge, state, base)
-        data = load_samples(args.file)
-        rec_id = args.id if args.id is not None else (len(data["records"]) + 1)
-        try:
-            rec = build_record(args.judge, args.a, raw, state=state,
-                               provenance="agent_seed",      # 纪律②：不允许外部指定
-                               rec_id=rec_id, keep_state=args.keep_state)
-        except RecordError:
-            # B 侧 stdout 非法（客户端崩溃/超时）—— 记 absent，**绝不用 a 顶替**
-            rec = build_record(args.judge, args.a, None, state=state,
-                               provenance="agent_seed",
-                               rec_id=rec_id, keep_state=args.keep_state)
-            rec["reason"] = ("B 侧输出非 JSON（rc=%s）：%s" % (rc, (err or "")[:120])).strip()
-        rec["runner"] = {"ensure": bool(args.ensure), "launched": launched,
-                         "rc": rc, "probe": detail}
-        data["records"].append(rec)
-        save_samples(args.file, data)
-        if args.b_out and raw:
-            with open(args.b_out, "w", encoding="utf-8", newline="\n") as f:
-                f.write(raw)
-        print(json.dumps(rec, ensure_ascii=False, indent=2))
-        print("[run] judge=%s laya_status=%s b=%r（b 恒来自 B 侧，未用 a 顶替）；累计 %d 条"
-              % (args.judge, rec["laya_status"], rec["b"], len(data["records"])))
-        if rec["laya_status"] != "ok":
-            print("      ⚠️ 本次未取到有效 B 值（%s）—— 已如实记为 %s、**不进一致率**；"
-                  "不得据此推测 Laya 的判断。"
-                  % (rec.get("reason") or "见 laya_status", rec["laya_status"]))
+        n_jobs = len(pairs)
+        for idx, (judge, a_val) in enumerate(pairs, 1):
+            raw, rc, err = _call_b(judge, state, base)
+            data = load_samples(args.file)
+            rec_id = args.id if args.id is not None else (len(data["records"]) + 1)
+            try:
+                rec = build_record(judge, a_val, raw, state=state,
+                                   provenance="agent_seed",   # 纪律②：不允许外部指定
+                                   rec_id=rec_id, keep_state=args.keep_state)
+            except RecordError:
+                # B 侧 stdout 非法（客户端崩溃/超时）—— 记 absent，**绝不用 a 顶替**
+                rec = build_record(judge, a_val, None, state=state,
+                                   provenance="agent_seed",
+                                   rec_id=rec_id, keep_state=args.keep_state)
+                rec["reason"] = ("B 侧输出非 JSON（rc=%s）：%s" % (rc, (err or "")[:120])).strip()
+            rec["runner"] = {"ensure": bool(args.ensure), "launched": launched,
+                             "rc": rc, "probe": detail,
+                             "batch": ([idx, n_jobs] if n_jobs > 1 else None)}
+            data["records"].append(rec)
+            save_samples(args.file, data)
+            if args.b_out and raw:
+                # 多 judge 时按 judge 加后缀，防后一条静默覆盖前一条（丢证据无声无息）
+                bpath = args.b_out
+                if n_jobs > 1:
+                    stem, ext = os.path.splitext(args.b_out)
+                    bpath = "%s.%s%s" % (stem, judge, ext or ".json")
+                with open(bpath, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(raw)
+            print(json.dumps(rec, ensure_ascii=False, indent=2))
+            print("[run] %sjudge=%s laya_status=%s b=%r（b 恒来自 B 侧，未用 a 顶替）；累计 %d 条"
+                  % (("(%d/%d) " % (idx, n_jobs)) if n_jobs > 1 else "",
+                     judge, rec["laya_status"], rec["b"], len(data["records"])))
+            if rec["laya_status"] != "ok":
+                print("      ⚠️ 本次未取到有效 B 值（%s）—— 已如实记为 %s、**不进一致率**；"
+                      "不得据此推测 Laya 的判断。"
+                      % (rec.get("reason") or "见 laya_status", rec["laya_status"]))
         return 0
     finally:
         if launched:
@@ -588,7 +653,10 @@ def selftest():
     f10b = _f("s10b.json")
 
     def _mk(a_val="code"):
-        return argparse.Namespace(file=f10, judge="self-judge", a=a_val, state="请求原文示例",
+        # ⚠️ v4.14.0 起 run 的 --a 是 **append 列表**（为支持带键多 judge）——夹具必须跟着边界改，
+        #    否则 `list("code")` 会被拆成 4 个裸 job ⇒ 参数校验直接拒绝、一条都不落
+        #    （**夹具出偏差时先怀疑夹具**：改谓词/基线，不得改期望值迁就它）
+        return argparse.Namespace(file=f10, judge="self-judge", a=[a_val], state="请求原文示例",
                                   state_file=None, base="http://127.0.0.1:1", ensure=False,
                                   timeout=1.0, id=None, keep_state=False, b_out=f10b)
 
@@ -638,8 +706,42 @@ def selftest():
         _check(rejected, "run 拒绝 --provenance（纪律②：无任何冒充人工标的入口）")
         _check(_stats(load_samples(f10))["n_qualified"] == 0,
                "run 写入的样本一律不进一致率分母（n_qualified 仍为 0）")
+
+        # (f) v4.14.0 多 judge 端到端（注入式）：一次调用写两条、保序、A 值不串、纪律②不被批量绕过
+        g["_call_b"] = lambda judge, state, base, timeout=600: (
+            good_b if judge == "self-judge" else think_b, 0, "")
+        ns_f = _mk()
+        ns_f.a = ["self-judge=code", "thinking-judge=接受"]
+        ns_f.judge = None
+        n_before = len(load_samples(f10)["records"])
+        _quiet(lambda: cmd_run(ns_f))
+        rs = load_samples(f10)["records"]
+        _check(len(rs) == n_before + 2 and rs[-2]["judge"] == "self-judge"
+               and rs[-1]["judge"] == "thinking-judge",
+               "带键 --a 一次写两条、按给定顺序", "got %r" % [(r["judge"], r["a"]) for r in rs[-2:]])
+        _check(rs[-2]["a"] == "code" and rs[-1]["a"] == "接受", "两条各自的 A 值未串位")
+        _check(all(r["laya_status"] == "ok" for r in rs[-2:]), "两条都取到有效 B 值")
+        _check(all(r["provenance"] == "agent_seed" for r in rs[-2:]),
+               "多 judge 批量同样恒为 agent_seed（纪律②不被批量绕过）")
+        _check(rs[-2]["id"] != rs[-1]["id"], "两条 id 自增、不撞")
     finally:
         g["_call_b"], le_mod.probe = old_call, old_probe
+
+    # ⑪ run 多 judge（v4.14.0）：解析正确 + 三种非法形态必须 fail-closed
+    print("⑪ run 多 judge：带键 --a 解析正确；混用/非法键/空取值一律报错")
+    _check(_split_a_list(["self-judge=code", "thinking-judge=接受"])
+           == [("self-judge", "code"), ("thinking-judge", "接受")],
+           "带键 --a 解析为 (judge, 取值) 对，且保序")
+    _check(_split_a_list(["code"]) == [(None, "code")],
+           "裸 --a 仍解析为 (None, 取值) —— 向后兼容不变")
+    for bad, why in [(["self-judge=code", "code"], "混用带键与裸 --a"),
+                     (["no-such-judge=x"], "非法 judge 键"),
+                     (["self-judge="], "空取值")]:
+        try:
+            _split_a_list(bad)
+            _check(False, "%s 必须报错（阴性对照）" % why)
+        except RecordError:
+            _check(True, "%s 必须报错（阴性对照）" % why)
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     # 汇总语由计数器生成，**不硬编码项数**（硬编码会在增删检查项时静默失真）
@@ -683,10 +785,12 @@ def main(argv=None):
 
     rn = sub.add_parser("run", help="一条命令完成采样：探活 → 跑 B 侧 → 与 --a 配对 → 落盘")
     rn.add_argument("--file", required=True, help="样本文件（**不设默认**：默认路径会掩盖写错位置）")
-    rn.add_argument("--judge", required=True, choices=sorted(JUDGE_B_FIELD),
-                    help="一次只跑一个 judge（多样本请多次调用：不同 judge 的 A 侧取值语义不同，"
-                         "合并在一个 --a 里必错）")
-    rn.add_argument("--a", required=True, help="A 侧（Realization A）本次判定取值 —— **由调用者给出**，本命令不代判")
+    rn.add_argument("--judge", default=None, choices=sorted(JUDGE_B_FIELD),
+                    help="**单 judge 模式**下与裸 --a 配对。⚠️ 与带键 --a 并用即报错（含义不明，宁可报错不猜）")
+    rn.add_argument("--a", required=True, action="append",
+                    help="A 侧取值 —— **由调用者给出**（本命令不代判）。两种形式：① 裸取值（单 judge，配 --judge）"
+                         "② `judge=取值`（v4.14.0 新增，**可重复** → 一次跑多 judge，各 judge 共用同一份 --state）"
+                         "　**不得混用**：要么全裸、要么全带键")
     rn.add_argument("--state", default=None, help="请求原文（送给 B 侧当输入；默认不落盘）")
     rn.add_argument("--state-file", default=None, help="从文件读请求原文（长文本/含引号时用）")
     rn.add_argument("--base", default=None, help="Laya 基址，缺省同 laya_client")
