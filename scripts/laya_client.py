@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # [自研工具] laya_client.py
-# 用途：ai-workflow 四个 judge（self-judge / method-judge / retrieval-judge / homework-judge）调用本地
+# 用途：ai-workflow 六个 judge（self-judge / method-judge / retrieval-judge / homework-judge /
+#       learning-judge / thinking-judge）调用本地
 #       Laya 服务的客户端——契约映射 + 超时重试 + 降级，把 Laya 的 answers 翻译成 judge 契约字段。
-# 适用场景：阶段 0 第 1 步（self-judge）、阶段 0 作业识别（homework-judge）、阶段 3 执行期六动作第②步
-#           （method-judge）、阶段 3 第 5 条前（retrieval-judge）。
+# 适用场景：阶段 0 第 0 步（thinking-judge）、阶段 0 第 1 步（self-judge）、阶段 0 作业识别
+#           （homework-judge）、阶段 3 执行期六动作第②步（method-judge）、阶段 3 第 5 条前
+#           （retrieval-judge）、阶段 6 收尾（learning-judge）。
 # 作者：ai-workflow 自研（作业模式-ai-workflow-v4.7.0-2026-09-23，2026-09-23）
 # 仓库：https://github.com/Garvin666/ai-workflow-tools
 """
@@ -62,7 +64,14 @@ TEMPLATES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "judge
 #   中文作业题走 multilingual 是无害且更稳的选择（english ckpt 跑中文的官方评估 ECE=0.376，为最差档）。
 #   服务可用后须补一次实测并回填实测值到 references/laya-backend.md。
 PINNED_MODEL_BY_KIND = {"method_judge": "multilingual", "retrieval_judge": "multilingual",
-                        "homework_judge": "multilingual"}
+                        "homework_judge": "multilingual", "thinking_judge": "multilingual"}
+# v4.11.0 追加：thinking_judge 同样钉 multilingual，且**这一条不是"稳妥起见"而是实测结论** ——
+#   Router 判语言的输入**只有 `state` 一个字段**（700+ token 的中文 `instructions` 完全不参与）。
+#   本模块的 state 就是**用户请求原文**，而用户请求必然夹带英文标识符（如 gen_skill_index.py /
+#   DEFAULT_ROOTS）⇒ 实测 script_profile.latin=0.6136 → **判成 english**，延迟 4912.4 ms vs
+#   1194.2 ms（**4.1×**），且 english ckpt 跑中文的官方评估 ECE=0.376（读中文最差的档）。
+#   ⇒ C20 + D16：`laya.status == "ok"` 时 `model_key` **必须**等于 `multilingual`，否则影子对照
+#     跑错模型 ⇒ 对照无效却被当成有效。数值与出处见 references/laya-backend.md §6.4。
 
 
 class LayaUnavailable(Exception):
@@ -314,6 +323,70 @@ def map_homework_judge(result, templates=None):
     return out
 
 
+def map_thinking_judge(result, templates=None):
+    """-> thinking-judge 的 **B 侧留痕三件套**：`{laya, verdict_probe, aux_probes}`。
+
+    ⚠️ **本函数刻意不产 `verdict`** —— B 侧裁决必须由与 A 侧**同一个** `thinking_model.aggregate`
+    从分布算出；这里只做三件事：
+      ① 把 Laya 的原料落成可留痕字段（`laya` 的 10 键，见 references/thinking-panel.md §5.2）；
+      ② 记下 B 侧同类现象 `axis_unfounded`（noul 明示不违规却挂了轴）—— **只留痕、不判 FAIL**：
+         影子侧行为不由本模块控制，对它判 FAIL 等于拿别人的病当自己的错，且会造出随机 FAIL 源（§2.4）；
+      ③ 填 `status` / `model_key` / `routing_reason`，供影子期口径（§4.2.1）与 D16（C20：必须 multilingual）。
+
+    `status` 三态：`ok`（正常）/ `degraded`（返回但已知降级）/ `absent`（服务不可用）——
+    ⚠️ **`absent` 不由本函数产生**：服务的不可达在调用侧表现为 exit 3 + `{"degraded": true}`，
+    由调用方据此写 `laya = null` 并在留痕里记为 `absent`（本模块不把"服务没起来"伪装成"判过了"）。
+    """
+    t = (templates or _load_templates())["thinking_judge"]
+    a = result["answers"]
+    routing = result.get("routing") or {}
+    veto = a.get("veto") or {}
+    axis_q = a.get("veto_axis") or {}
+    probe_q = a.get("verdict_probe") or {}
+    band = t["thresholds"]["ambiguity_band"]
+
+    raw_noul = veto.get("noul")
+    noul = float(raw_noul) if isinstance(raw_noul, (int, float)) and not isinstance(raw_noul, bool) else None
+    axis_probs = axis_q.get("probabilities") or {}
+    axis_top = max(axis_probs.items(), key=lambda kv: kv[1])[0] if axis_probs else ""
+    probe_probs = probe_q.get("probabilities") or {}
+    probe_top = max(probe_probs.items(), key=lambda kv: kv[1])[0] if probe_probs else ""
+
+    laya = {
+        "status": "degraded" if routing.get("degraded") else "ok",
+        "model_key": routing.get("model"),
+        "noul_veto": round(noul, 4) if noul is not None else None,
+        "veto_axis": axis_top,
+        # 轴门控在 B 侧的同类现象：noul 明示"不违规"（< 否决命中线）却仍给出了轴。
+        # ⚠️ 只留痕；A 侧的同类情形才判 FAIL（D10）—— 见 §2.4「判据不得跨侧套用」。
+        "axis_unfounded": bool(noul is not None and noul < band[1] and axis_top not in ("", "无")),
+        "max_probability": round(max(axis_probs.values()), 4) if axis_probs else None,
+        "entropy_confidence": axis_q.get("confidence"),
+        "latency_ms": (result.get("meta") or {}).get("latency_ms"),
+        # ⚠️ 必留：否则无法区分"判定差"与"路由又走错"（实测走错一次 4.1× 延迟）—— §4.2.1
+        "routing_reason": routing.get("reason") or routing.get("language"),
+        "script_profile": routing.get("script_profile"),
+    }
+    aux = {}
+    for k in ("scope_breach", "irreversible", "touches_credentials"):
+        q = a.get(k) or {}
+        v = q.get("noul")
+        # 旁证的落盘形态统一为 bool（阈值同源：>= VETO_HIT 视为命中）；缺失即 None，**不默认 false**
+        aux[k] = None if not isinstance(v, (int, float)) or isinstance(v, bool) else bool(float(v) >= band[1])
+    return {
+        "laya": laya,
+        # ⚠️ 旁证两件套**只留痕**：不进 dimensions / distribution / 任何派生（C21 / D11）。
+        #    `verdict_probe` 测的是"直接问结论"这条结构上不同的路径，**不进一致率**。
+        "verdict_probe": probe_top,
+        "aux_probes": aux,
+        "_laya": {
+            "model_key": routing.get("model"),
+            "latency_ms": (result.get("meta") or {}).get("latency_ms"),
+            "usage": result.get("usage"),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # questions 构造
 # ---------------------------------------------------------------------------
@@ -336,6 +409,26 @@ def build_questions(kind, candidates=None, templates=None):
         put("ambiguity", t["ambiguity"])
         for qid, q in t["dimensions"].items():
             put(qid, q)
+        return qs
+
+    if kind == "thinking_judge":
+        # 任务审计：否决（noul，唯一依据）+ 否决轴（choice 7，受 triggered 门控）+ 模糊（noul）
+        # + T1–T4 维度；另有**只留痕**的旁证题（verdict_probe / aux_probes）—— 不参与任何派生（C21）。
+        # **无候选注入**：审计没有候选池（同 homework_judge 的理由）。
+        # ⚠️ 模板里的 `_note` 是**文档注释**，不得当成题目发给 Laya ⇒ 统一剥掉下划线前缀键。
+        def put_clean(qid, q):
+            put(qid, {k: v for k, v in q.items() if not str(k).startswith("_")})
+
+        put("veto", t["veto"])
+        put_clean("veto_axis", t["veto_axis"])
+        put("ambiguity", t["ambiguity"])
+        for qid, q in t["dimensions"].items():
+            put(qid, q)
+        put_clean("verdict_probe", t["verdict_probe"])
+        for qid, q in t["aux_probes"].items():
+            if str(qid).startswith("_"):
+                continue
+            put_clean(qid, q)
         return qs
 
     put(kind == "method_judge" and "gap_class" or "source_class", t["gap_class" if kind == "method_judge" else "source_class"])
@@ -391,6 +484,8 @@ def run_judge(kind, state, candidates=None, model=None, base=DEFAULT_BASE, templ
         out = map_method_judge(result, candidates or [], templates)
     elif kind == "homework_judge":
         out = map_homework_judge(result, templates)
+    elif kind == "thinking_judge":
+        out = map_thinking_judge(result, templates)
     else:
         out = map_retrieval_judge(result, candidates or [], templates)
     out["_laya"]["attempts"] = meta["attempts"]
@@ -429,7 +524,8 @@ def selfcheck(base=DEFAULT_BASE):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Laya judge 客户端（契约映射 + 重试 + 降级）")
-    ap.add_argument("--judge", choices=["self-judge", "method-judge", "retrieval-judge", "homework-judge"])
+    ap.add_argument("--judge", choices=["self-judge", "method-judge", "retrieval-judge", "homework-judge",
+                                        "thinking-judge"])
     ap.add_argument("--state")
     ap.add_argument("--what"), ap.add_argument("--input"), ap.add_argument("--expect")
     ap.add_argument("--need"), ap.add_argument("--clues"), ap.add_argument("--workspace")
@@ -458,6 +554,11 @@ def main(argv=None):
             ap.error("homework-judge 需要 --state")
         if args.clues:
             state = state_of(kind, {"request_text": state, "context_clues": args.clues})
+    elif kind == "thinking_judge":
+        # 任务审计：state = 用户请求**原文**（也是 Router 判语言的唯一输入 ⇒ 必须钉 multilingual，C20）
+        state = args.state or ""
+        if not state:
+            ap.error("thinking-judge 需要 --state（用户请求原文）")
     elif kind == "method_judge":
         state = state_of(kind, {"step_what": args.what or "", "step_input": args.input or "",
                                 "step_expect": args.expect or ""})
