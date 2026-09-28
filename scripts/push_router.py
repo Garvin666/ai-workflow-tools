@@ -210,7 +210,11 @@ def scan_selftool_header(path: Path) -> dict | None:
                 s = l2.strip().lstrip("#").lstrip("*").lstrip("/").strip()
                 for key in HEADER_KEYS:
                     if not info.get(key) and (s.startswith(key + "：") or s.startswith(key + ":")):
-                        info[key] = s.split("：", 1)[-1].split(":", 1)[-1].strip()
+                        # ⚠️ 取值 = 分隔符**之后**的整段，不能再用 `.split(":", 1)[-1]` 二次切：
+                        # 键用全角冒号、值是 URL（`仓库：https://…`）时，第二次按 ASCII 冒号切
+                        # 会把 scheme 吞掉（实测存成 `//github.com/…`）。按实际命中的分隔符切片。
+                        sep = "：" if s.startswith(key + "：") else ":"
+                        info[key] = s[len(key) + len(sep):].strip()
             return info
 
     return None
