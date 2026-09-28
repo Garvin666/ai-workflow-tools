@@ -67,6 +67,20 @@ DEFAULT_INDEX = Path.home() / ".workbuddy" / "skills" / "README.md"
 # 索引文件名本身就在技能根下 —— 扫描时不能被当成技能目录
 SKIP_DIRS = {"node_modules", "__pycache__", ".git", "_archive", "_backup-v1", "_backup-v2",
              "_backup-v2.3", "_backup-v3.0", "_backup-v3.2.1", "_backup-v3.3.0"}
+
+
+def is_skipped(name: str) -> bool:
+    """这个目录名是否不该算技能。
+
+    ⚠ 2026-09-26 实测踩过：白名单只认 `_backup-*` 这种**下划线 + 固定版本号**的形态，
+    而运行时自我保护产生的备份是 `ai-workflow.bak-20260926-124022` —— **没有下划线、带时间戳**
+    的第三种形态，于是被当成一个技能算进索引（技能数虚高 1，指纹随之漂移）。
+    所以这里加一条与命名无关的通用规则：名字里出现 `.bak` / `.backup` 一律跳过。
+    """
+    if name in SKIP_DIRS or name.startswith("."):
+        return True
+    return ".bak" in name or ".backup" in name
+
 DESC_MAX = 78
 
 
@@ -118,7 +132,7 @@ def collect(roots: list[Path]) -> tuple[list[dict], list[str]]:
             missing.append(str(root))
             continue
         for d in sorted(root.iterdir()):
-            if not d.is_dir() or d.name in SKIP_DIRS or d.name.startswith("."):
+            if not d.is_dir() or is_skipped(d.name):
                 continue
             f = d / "SKILL.md"
             if not f.is_file():
@@ -161,7 +175,7 @@ def render(entries: list[dict], roots: list[Path]) -> str:
         "# 技能库索引（由 `gen_skill_index.py` 自动生成，请勿手改）",
         "",
         f"<!-- fp: {fingerprint(roots)[0]} -->  源集合**内容**指纹（不含 mtime）；`--check` 就是拿它与实时值比对",
-        f"> 生成时间：{time.strftime('%Y-%m-%d %H:%M')} ｜ 技能数：**{len(entries)}**（自动跳过 `_backup-*` / `_archive` / `.git`）",
+        f"> 生成时间：{time.strftime('%Y-%m-%d %H:%M')} ｜ 技能数：**{len(entries)}**（自动跳过 `_backup-*` / `*.bak*` / `*.backup*` / `_archive` / `.git` / 点开头）",
         f"> 扫描根：{'；'.join(str(r) for r in roots)} ｜ 文件位置：各技能的 `<根>/<目录名>/SKILL.md`",
         "> **读法（阶段 0）**：先在本表**按簇**定位候选 → **只读命中候选的 `SKILL.md` frontmatter** →",
         "> 一个都不命中才回落全量 Glob。**索引过期时以全量为准并重跑本脚本重建**（`--check` 可判新鲜度）。",
@@ -199,7 +213,7 @@ def fingerprint(roots: list[Path]) -> tuple[str, int]:
         if not root.is_dir():
             continue
         for d in sorted(root.iterdir()):
-            if not d.is_dir() or d.name in SKIP_DIRS or d.name.startswith("."):
+            if not d.is_dir() or is_skipped(d.name):
                 continue
             f = d / "SKILL.md"
             if not f.is_file():
