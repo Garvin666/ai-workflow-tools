@@ -25,9 +25,14 @@ Git Data API：blob → tree(base_tree) → commit(parent=远端当前 HEAD) →
      ⚠️ 因此自证的「blob sha 比对」只在 `--apply` 时执行；dry-run 只报出**本地 sha**
      （它由 `git rev-parse <rev>:<path>` 算出，本来就是权威值）。
   2. **删除保护**：远端删除不可逆，默认只列出待删项不执行，须显式 `--allow-delete`。
-  3. **基线条校验**：`--expect-remote <sha>` 要求远端 HEAD 等于该值，否则 FAIL ——
+  3. **基线条校验**：`--expect-remote <sha>` 要求远端 HEAD 等于该值，**否则 FAIL** ——
      防「基于过时基线推送」。并发保护另有天然一道：commit 的 parent 取远端当前 HEAD，
      且 PATCH ref 用 force=false，非快进会失败。
+     ⚠️ **v4.14.1 修两处同源缺陷**（此前这条防线会**误报**，并把唯一证据截掉）：
+     ① 原为**精确字符串比对** ⇒ 传短 sha（本仓文档与示例的惯用写法）**永远 FAIL**；
+     现口径 = 等值 或 **≥7 位前缀匹配**（4–6 位太短易撞，仍拒）。
+     ② 失败时把两侧截成 `[:10]` 打印 ⇒ 差异落在第 10 位之后时，报错信息**看起来两侧一模一样**，
+     把唯一的差异证据截掉了；现打印**完整** sha ＋ 首个不同字符位置。
 
 blob sha 自证：本地侧内容一律从 `git cat-file blob <rev>:<path>` 取（git 对象库天然 LF），
 不用工作区文件字节（那是 CRLF）—— 直接用工作区字节会把 CRLF 推进仓库。新建 blob 后
@@ -156,7 +161,9 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="真正推送（默认只 dry-run）")
     ap.add_argument("--allow-delete", action="store_true",
                     help="允许删除远端文件（默认只列出待删项、不执行 —— 远端删除不可逆）")
-    ap.add_argument("--expect-remote", help="要求远端 HEAD 等于该 sha，否则 FAIL（防基于过时基线推送）")
+    ap.add_argument("--expect-remote",
+                    help="要求远端 HEAD 等于该 sha，否则 FAIL（防基于过时基线推送）；"
+                         "v4.14.1 起接受 ≥7 位短 sha 前缀")
     ap.add_argument("--message", help="提交信息（默认取 --head 的提交信息）")
     ap.add_argument("--result-file", help="把摘要写入该文件（默认只打印）")
     a = ap.parse_args()
@@ -186,13 +193,29 @@ def main() -> int:
     out("远端 HEAD = %s" % remote_head)
     out("base_tree = %s" % base_tree)
 
-    if a.expect_remote and a.expect_remote != remote_head:
-        out("[FAIL] 基线条不符：期望 --expect-remote=%s，实际远端 HEAD=%s"
-            % (a.expect_remote[:10], remote_head[:10]))
-        out("       说明远端在两次推送之间被改动过（并发或他人推送）→ 请先人工核对再决定基线。")
-        if a.result_file:
-            save_result(a.result_file, lines, root)
-        return 1
+    if a.expect_remote:
+        # v4.14.1 修两处同源缺陷：
+        #   ① 原为**精确字符串比对** ⇒ 传短 sha（git 惯例：≥4 位唯一前缀，本仓文档/示例的惯用写法）
+        #      永远 FAIL；现口径 = 等值 或 **≥7 位前缀匹配**（4–6 位太短易撞，仍拒）。
+        #   ② 失败时把两侧截成 `[:10]` 打印 ⇒ 差异落在第 10 位之后时，报错信息**看起来两侧一模一样**，
+        #      把唯一的差异证据截掉了（"固定长度窗口是定时炸弹"的又一例）；
+        #      现打印**完整** sha ＋ 首个不同字符位置。
+        exp = a.expect_remote.strip()
+        if not (exp == remote_head or (len(exp) >= 7 and remote_head.startswith(exp))):
+            same = 0
+            for x, y in zip(exp, remote_head):
+                if x != y:
+                    break
+                same += 1
+            out("[FAIL] 基线条不符：期望 --expect-remote=%s，实际远端 HEAD=%s" % (exp, remote_head))
+            out("       长度 %d vs %d；前 %d 个字符相同，自第 %d 位起不同。"
+                % (len(exp), len(remote_head), same, same + 1))
+            out("       说明远端在两次推送之间被改动过（并发或他人推送）→ 请先人工核对再决定基线。")
+            if a.result_file:
+                save_result(a.result_file, lines, root)
+            return 1
+        if exp != remote_head:
+            out("（--expect-remote=%s 系远端 HEAD 的前缀，按短 sha 匹配通过）" % exp)
 
     tree = json.loads(gh("GET", "repos/%s/git/trees/%s?recursive=1" % (a.repo, base_tree)))
     if tree.get("truncated"):
