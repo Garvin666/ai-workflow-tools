@@ -46,6 +46,13 @@ ai-workflow 自研工具与技能的**公开留痕仓库**（源码同步 + 版�
 | gen_opt_report.py / verify_opt_report.py | 优化报告渲染（data-key 锚点）+ 三态校验器（成对使用） |
 | check_test_access.py | 留出测试集访问台账的两条不变量审计（防泄漏） |
 
+**④ 前端视觉评审与配色数值闸（演示台 / 设计稿改造沉淀）**
+
+| 脚本 | 用途 |
+| --- | --- |
+| shot_seed.py | 无头截图「播种」脚手架：等就绪标记出现后 click() 页面自带按钮，让默认是空状态的数据页自动进入有数据状态；跑完从备份还原并复核残留（残留非 0 即 exit 3）。**只走用户真会走的路径**，不造元素、不调内部函数 |
+| palette_check.py | 配色数值闸：四条 WCAG 对比度（页面底 + 纯白卡面双底各算一次）+ 主按钮白字承载 + 全量语义色两两 CIEDE2000 ΔE00 ≥2.0。令牌**唯一真源 = 交付件**（从 `<style>` 读，缺令牌 exit 3）。零依赖单文件，`--selftest` 跑 Sharma 标准测试集 |
+
 ## 安装与使用
 
 ```bash
@@ -66,7 +73,7 @@ git clone https://github.com/Garvin666/ai-workflow-skill.git ~/.workbuddy/skills
 ```
 ai-workflow-tools/
 ├── README.md
-└── scripts/          # 23 个自研脚本（头部均有 [自研工具] 标注）
+└── scripts/          # 25 个自研脚本（头部均有 [自研工具] 标注）
 ```
 
 ## 注意事项
