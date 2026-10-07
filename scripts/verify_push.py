@@ -182,6 +182,32 @@ def commit_sha(repo: str, ref: str) -> str:
     return api("repos/%s/commits/%s" % (repo, urllib.parse.quote(ref)))["sha"]
 
 
+def resolve_sha(repo: str, sha: str | None) -> str:
+    """把可能是**缩写**的 sha 归一到全长 40 位。
+
+    为什么需要它：`repos/{repo}/git/commits/{sha}` 端点对**缩写 sha** 返回 404
+    （2026-10-07 实测），而 `repos/{repo}/commits/{sha}` 能解析 —— 于是「同一入参
+    两个组件口径不一致」会造出**假红**（`push_router` 前缀匹配放行，本验收器却 FAIL）。
+    修法是**归一到全长再比较**，不是放松断言。解析失败则原样返回，由 `sha_match`
+    的前缀比较兜底。
+    """
+    s = (sha or "").strip()
+    if len(s) >= 40:
+        return s
+    try:
+        return commit_sha(repo, s)
+    except (RuntimeError, ApiError):
+        return s
+
+
+def sha_match(full: str, given: str | None) -> bool:
+    """`full` 与 `given` 是否指同一提交 —— `given` 允许是**缩写**（前缀匹配）。"""
+    g = (given or "").strip()
+    if not g:
+        return False
+    return full == g or full.startswith(g)
+
+
 def remote_blobs(repo: str, commit: str) -> dict[str, str]:
     tree_sha = api("repos/%s/git/commits/%s" % (repo, commit))["tree"]["sha"]
     return tree_blobs(repo, tree_sha)
@@ -368,6 +394,37 @@ def annotate_check(entry: dict, rev: str, path: str) -> None:
         "缺 " + "/".join(lack) + "（" + "；".join(n for k, okv, n in checks if not okv) + "）")
 
 
+# ---------------------------------------------------------------- 自测
+def _selftest() -> int:
+    """`sha_match` 的阴性+阳性对照 —— 证明「前缀匹配」判据**非恒真**。
+
+    背景（2026-10-07 实测）：`--expect-remote` / `--prev-remote` 喂 10 位缩写 sha 会得到
+    「实际值 == 期望值」却判 FAIL 的**假红**（旧实现用精确串比较，且 `/git/commits/{sha}`
+    对缩写返回 404，而 `push_router` 是前缀匹配）。修法 = 归一到全长 + 前缀比较。
+    本自测只用纯函数、不联网。
+    """
+    ok = True
+
+    def chk(name: str, cond: bool) -> None:
+        nonlocal ok
+        print("   [%s] %s" % (" OK " if cond else "FAIL", name))
+        ok = ok and bool(cond)
+
+    full = "0123456789abcdef0123456789abcdef01234567"
+    print("[selftest] ① 阳性：缩写应判「命中」（本次修复的核心）")
+    chk("全长相等 → 命中", sha_match(full, full))
+    chk("10 位缩写 → 命中", sha_match(full, full[:10]))
+    chk("7 位缩写 → 命中", sha_match(full, full[:7]))
+    chk("前后空白被忽略 → 命中", sha_match(full, "  " + full[:10] + " "))
+    print("[selftest] ② 阴性：不应误判（判据非恒真）")
+    chk("非前缀 → 不命中", not sha_match(full, "ffffffff"))
+    chk("空串 → 不命中", not sha_match(full, ""))
+    chk("None → 不命中", not sha_match(full, None))
+    chk("大小写不符 → 不命中（sha 为小写）", not sha_match(full.upper(), full))
+    print("[selftest] %s" % ("全部通过" if ok else "存在 FAIL"))
+    return 0 if ok else 1
+
+
 # ---------------------------------------------------------------- 主流程
 def main() -> int:
     ap = argparse.ArgumentParser(description="推送结果独立验收器（与推送脚本零代码共享）")
@@ -381,7 +438,12 @@ def main() -> int:
                          "混合仓有两条本地来源时，用本参数切到另一条（如工作区档案根）分别验收")
     ap.add_argument("--expect-version", default=None, help="期望版本号（默认从本地 rev 的 SKILL.md 自动推导）")
     ap.add_argument("--allow-dirty", action="store_true", help="放行工作区未提交改动（默认阻塞）")
+    ap.add_argument("--selftest", action="store_true",
+                    help="自测 sha_match 前缀匹配判据（阴性+阳性对照，不联网）")
     a = ap.parse_args()
+
+    if a.selftest:
+        return _selftest()
 
     root = Path(a.skill_dir).resolve()
     rev = a.rev
@@ -426,16 +488,19 @@ def main() -> int:
         return 2
 
     # ---------- 判据 1：远端 HEAD ----------
+    # 归一：`--expect-remote` / `--prev-remote` 允许给缩写 sha（与 push_router 口径一致）。
+    expect_remote = resolve_sha(a.repo, a.expect_remote) if a.expect_remote else None
+    prev_remote = resolve_sha(a.repo, a.prev_remote) if a.prev_remote else None
     print("")
     print("-- 判据 1：远端本体仓 HEAD --")
     if a.expect_remote:
-        rec("OK" if head_o == a.expect_remote else "FAIL", "远端 HEAD == 期望值",
-            "实际 %s / 期望 %s" % (head_o[:10], a.expect_remote[:10]))
+        rec("OK" if sha_match(head_o, expect_remote) else "FAIL", "远端 HEAD == 期望值",
+            "实际 %s / 期望 %s" % (head_o[:10], (expect_remote or a.expect_remote)[:10]))
     else:
         rec("OK", "远端 HEAD 已取到", head_o[:10] + "（未指定 --expect-remote，不做等值断言）")
     if a.prev_remote:
-        rec("OK" if head_o != a.prev_remote else "FAIL", "远端 HEAD ≠ 推送前值（确非空跑）",
-            "推送前 %s" % a.prev_remote[:10])
+        rec("OK" if not sha_match(head_o, prev_remote) else "FAIL", "远端 HEAD ≠ 推送前值（确非空跑）",
+            "推送前 %s" % (prev_remote or a.prev_remote)[:10])
     else:
         rec("SKIP", "远端 HEAD ≠ 推送前值", "未传 --prev-remote")
 
@@ -460,9 +525,11 @@ def main() -> int:
         rec("SKIP", "远端独有项早于本次推送", "未传 --prev-remote —— 无法机器证明，需人工确认")
     else:
         try:
-            base = tree_blobs(a.repo, api("repos/%s/git/commits/%s" % (a.repo, a.prev_remote))["tree"]["sha"])
+            base = tree_blobs(a.repo, api("repos/%s/git/commits/%s" % (a.repo, prev_remote))["tree"]["sha"])
         except (RuntimeError, ApiError) as e:
-            rec("FAIL", "推送前 tree 可取", "%s（⚠️ `/git/commits/{sha}` 端点对**缩写 sha** 会 404，请给完整 40 位）" % str(e)[:100])
+            rec("FAIL", "推送前 tree 可取",
+                "%s（⚠️ 已尝试把缩写 sha 归一到全长；此处仍 404 说明 `--prev-remote` 给的值无法解析，"
+                "请核对是否为该仓的真实提交）" % str(e)[:100])
             base = None
         if base is not None:
             extra = sorted(p for p in remote if p not in local)
