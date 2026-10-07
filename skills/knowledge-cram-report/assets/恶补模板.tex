@@ -1,0 +1,24 @@
+% 恶补报告 · 版式导言区（经 pandoc --include-in-header 注入）
+%
+% 【设计约束】本文件**不引入任何新宏包**。
+%   理由：pandoc 默认模板已按 -V 参数配置好 fontspec / xeCJK / geometry / hyperref / setspace；
+%   再 `\usepackage` 同名包会触发 option clash 而**编译失败**；
+%   而引入 MiKTeX 未装的包会触发首次安装（可能失败或长时间阻塞）。
+%   故这里只做「长度与间距」类微调 —— 零新依赖，零冲突面。
+%
+% 【口径单源】字体 / 页边距 / 字号 / 行距由 cram_render.py 的 LAYOUT 通过 -V 传入，
+%   本文件**不得**再重复设置这些量（那会造成两处口径）。
+
+\AtBeginDocument{%
+  % 中文段落用「段间距」而不是「首行缩进」来分段：报告里段落短、缩进会显得碎
+  \setlength{\parindent}{0pt}%
+  \setlength{\parskip}{0.5em}%
+}
+
+% 引用块（每条知识点末尾的「> 来源：…」）左右留白收窄 ——
+% 默认的 quote 环境会让每条来源锚占掉接近半屏，报告会显得松散。
+\makeatletter
+\renewenvironment{quote}%
+  {\list{}{\rightmargin=1.0em\leftmargin=1.4em}\item\relax}%
+  {\endlist}
+\makeatother
