@@ -481,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--expect-items", type=int, default=None, help="知识点条数（V6）；缺省由 md 的 ### N. 标题数推得")
     ap.add_argument("--external", action="store_true", help="目的地为工作区外或对外可见 ⇒ V4b 参与判定")
     ap.add_argument("--dest-root", default=None,
-                    help="归档根（V10 用），如 C:/Users/26717/Desktop/恶补")
+                    help="归档根（V10 用），如 E:/ChatGPT/工作流/恶补")
     ap.add_argument("--project", default=None,
                     help="项目名（V10 用；归档按项目名分层）")
     ap.add_argument("--template", default=None, help="额外导言区 .tex（--include-in-header）")
