@@ -160,7 +160,88 @@ def cluster_key(name: str, counts: dict) -> str:
     return "独立技能"
 
 
-def render(entries: list[dict], roots: list[Path]) -> str:
+USAGE_LEDGER_NAME = "_usage_ledger.tsv"
+
+
+def load_usage(root: Path) -> dict:
+    """读取同目录下的 `<根>/_usage_ledger.tsv`（技能使用台账），返回 {目录名: (状态, 次数)}。
+
+    ⭐ 2026-10-08 新增（技能库归并梳理任务 · 阶段 3）。**为什么单列一个 sidecar 文件而不写进
+    SKILL.md**：本索引的指纹刻意「只由内容决定」，若把 usage 状态写进 SKILL.md 或写进索引
+    正文再参与指纹，则**每次台账刷新都会让索引判 STALE**，把「内容变没变」这个诚实的判据
+    污染成「台账新不新」。所以：**台账状态只影响渲染，不参与 fingerprint**。
+
+    ⭐ 为什么不写进 SKILL.md frontmatter：102 个技能里 26 个是非自建（市场安装），改它们
+    frontmatter 会在下次市场升级时被覆盖 —— 台账会静默丢失。sidecar 文件是市场不管的。
+
+    文件格式（制表符分隔，`#` 开头为注释）：
+        技能目录名\t状态\t调用次数
+    状态取 `used` / `unused`。缺文件时返回空 dict ⇒ 索引退化为「不标注」的旧行为（向后兼容）。
+    """
+    f = root / USAGE_LEDGER_NAME
+    if not f.is_file():
+        return {}
+    out: dict = {}
+    try:
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            parts = ln.split("\t")
+            if len(parts) < 2:
+                continue
+            name, status = parts[0].strip(), parts[1].strip().lower()
+            try:
+                calls = int(parts[2]) if len(parts) > 2 and parts[2].strip() else 0
+            except ValueError:
+                calls = 0
+            out[name] = (status, calls)
+    except OSError:
+        return {}
+    return out
+
+
+UNUSED_SECTION = "未启用区"
+
+
+def _row(e: dict, usage: dict) -> str:
+    """把一条技能渲染成表格行。`unused` 只在此处被**显式打标**（主表已不出现它们）。"""
+    d = e["desc"] or "（frontmatter 无 description）"
+    if len(d) > DESC_MAX:
+        d = d[:DESC_MAX] + "…"
+    marks = []
+    st, calls = usage.get(e["dir"], ("", 0))
+    if st == "unused":
+        marks.append("⛔未启用")
+    elif st == "used":
+        marks.append(f"✅{calls}次" if calls else "✅")
+    if e["selfbuilt"]:
+        marks.append("⭐自研")
+    mark = (" " + " ".join(marks)) if marks else ""
+    return f"| `{e['dir']}`{mark} | {d} |"
+
+
+def _table(members: list[dict], usage: dict, lines: list[str]) -> None:
+    lines.append("| 技能 | 用途 |")
+    lines.append("| --- | --- |")
+    for e in members:
+        lines.append(_row(e, usage))
+
+
+def render(entries: list[dict], roots: list[Path], partition: bool = True) -> str:
+    """渲染索引正文。
+
+    ⭐ 2026-10-08（技能库归并梳理任务 · 阶段 5 · **档 1「仅索引分区」**）：`partition=True`
+    时把台账标为 `unused` 的技能**从各簇表里摘出去**，统一收到末尾的「未启用区」。
+
+    🔴 为什么改：原先只是**就地打 ⛔ 标** —— 结果「真正在用的 18 个」被淹没在 102 行里，
+    阶段 0 按簇定位候选时要先把 84 行噪音读完。分区后主表 = 在用技能，信噪比从 18/102 提到 18/18。
+    这是**纯显示层**改动：磁盘上没有任何技能被移动/删除，装载状态未变，随时可逆
+    （`partition=False` 即回到旧行为）。所以「候选下线池」这个措辞在末尾区块里写得比原先更重。
+
+    ⚠️ 分区**不参与指纹**：指纹只算 `目录名 + SKILL.md 内容`，与渲染布局无关
+    （同 `load_usage` 的理由）。所以分区与否不影响 `--check`。
+    """
     counts: dict = {}
     for e in entries:
         if "-" in e["dir"]:
@@ -171,6 +252,14 @@ def render(entries: list[dict], roots: list[Path]) -> str:
     for e in entries:
         groups.setdefault(cluster_key(e["dir"], counts), []).append(e)
 
+    # 台账：分区/打标都靠它。取所有根的并集（通常只有一个根）。
+    usage: dict = {}
+    for root in roots:
+        usage.update(load_usage(root))
+    is_unused = lambda d: usage.get(d, ("", 0))[0] == "unused"          # noqa: E731
+    n_unused = sum(1 for e in entries if is_unused(e["dir"]))
+    n_used = len(entries) - n_unused
+
     lines = [
         "# 技能库索引（由 `gen_skill_index.py` 自动生成，请勿手改）",
         "",
@@ -180,24 +269,64 @@ def render(entries: list[dict], roots: list[Path]) -> str:
         "> **读法（阶段 0）**：先在本表**按簇**定位候选 → **只读命中候选的 `SKILL.md` frontmatter** →",
         "> 一个都不命中才回落全量 Glob。**索引过期时以全量为准并重跑本脚本重建**（`--check` 可判新鲜度）。",
         "> 本表刻意只放「技能名 + 用途摘要」：全量表 ≈ 各 SKILL.md frontmatter 的 1/4 字节，这正是它的存在理由。",
-        "",
     ]
+    if usage:
+        if partition and n_unused:
+            lines += [
+                f"> 🏷️ **使用标注**（来自 `{USAGE_LEDGER_NAME}`，只影响显示、**不参与指纹**）：",
+                f"> 下方**主表只列在用的 {n_used} 个**；`⛔未启用` 的 **{n_unused}** 个已**分区**到文末「{UNUSED_SECTION}」"
+                "（仅索引分区，磁盘上**未移动/未删除**任何技能，装载状态不变，可逆）。",
+                f"> `✅{'{n}次'}`/`✅` = 有过真实调用；`⭐自研` = frontmatter `selfbuilt: true`。",
+            ]
+        else:
+            lines += [
+                f"> 🏷️ **使用标注**（来自 `{USAGE_LEDGER_NAME}`，只影响显示、**不参与指纹**）：",
+                f"> `⛔未启用` = 会话记录中零调用（共 **{n_unused}** 个）；无标注 = 有过真实调用；`⭐自研` = frontmatter `selfbuilt: true`。",
+                "> ⛔ 类是**候选下线池**，不是「已删除」—— 装载状态未变，仅标注。",
+            ]
+    lines.append("")
+
+    # 分区：主表只留「在用」；unused 单独成区。台账缺失时不分区（旧行为）。
+    do_partition = bool(partition and usage)
+    main_groups: dict = {}
+    pool: list[dict] = []
+    for k, members in groups.items():
+        if do_partition:
+            keep = [e for e in members if not is_unused(e["dir"])]
+            drop = [e for e in members if is_unused(e["dir"])]
+            # 一个簇全被摘空时不渲染空簇标题
+            if keep:
+                main_groups[k] = keep
+            pool.extend(drop)
+        else:
+            main_groups[k] = members
+
     # 簇间按成员数降序，`独立技能` 固定排最后
-    keys = sorted([k for k in groups if k != "独立技能"], key=lambda k: (-len(groups[k]), k))
-    if "独立技能" in groups:
+    keys = sorted([k for k in main_groups if k != "独立技能"],
+                  key=lambda k: (-len(main_groups[k]), k))
+    if "独立技能" in main_groups:
         keys.append("独立技能")
     for k in keys:
-        members = sorted(groups[k], key=lambda e: e["dir"])
+        members = sorted(main_groups[k], key=lambda e: e["dir"])
         lines.append(f"## {k}（{len(members)}）")
         lines.append("")
-        lines.append("| 技能 | 用途 |")
-        lines.append("| --- | --- |")
-        for e in members:
-            d = e["desc"] or "（frontmatter 无 description）"
-            if len(d) > DESC_MAX:
-                d = d[:DESC_MAX] + "…"
-            mark = " ⭐自研" if e["selfbuilt"] else ""
-            lines.append(f"| `{e['dir']}`{mark} | {d} |")
+        _table(members, usage, lines)
+        lines.append("")
+
+    if pool:
+        lines += [
+            f"## ⛔ {UNUSED_SECTION}（{len(pool)}）",
+            "",
+            "> **这是候选下线池，不是「已删除」**：以下技能在会话记录里**零真实调用**，因此被"
+            "**移出上表、仅在索引里分区**。磁盘上**未移动、未修改、未删除**任何一个技能目录，"
+            "装载状态与从前完全一致 —— 随时可回退（删掉本节、把行放回各簇即可）。",
+            "> 阶段 0 按簇找候选时**默认不看本节**；只有当全表都不命中、要扩大搜索面时才回看这里。",
+            "> 台账口径见 `ai-workflow/scripts/gen_skill_index.py` 的 `load_usage` docstring。",
+            "",
+        ]
+        for e in sorted(pool, key=lambda e: e["dir"]):
+            lines.append(f"- `{e['dir']}`{' ⭐自研' if e['selfbuilt'] else ''} — "
+                         f"{(e['desc'] or '（frontmatter 无 description）')[:DESC_MAX]}")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
