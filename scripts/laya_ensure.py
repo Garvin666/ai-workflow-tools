@@ -44,6 +44,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import socket
@@ -291,10 +292,19 @@ def cmd_ensure(args):
 
 
 def cmd_with(args):
-    """拉到就绪 → 执行被包装命令 → 透传其退出码。"""
-    cmd = list(args.cmd)
-    while cmd and cmd[0] == "--":
-        cmd.pop(0)
+    """拉到就绪 → 执行被包装命令 → 透传其退出码。
+
+    被包装命令来自 `args.wrapped`（`main` 按**第一个 `--`** 切分后的后半段）；
+    兼容旧的 `args.cmd` 列表形态（selftest 与历史调用方直接构造 Namespace）。
+    """
+    cmd = getattr(args, "wrapped", None)
+    if cmd is None:
+        cmd = list(getattr(args, "cmd", None) or [])
+        if isinstance(cmd, str):
+            cmd = [cmd]
+        while cmd and cmd[0] == "--":
+            cmd.pop(0)
+    cmd = list(cmd)
     if not cmd:
         print("[with] 缺少被包装命令：laya_ensure.py with -- <cmd...>", file=sys.stderr)
         return EXIT_MISCONFIG
@@ -329,7 +339,16 @@ def cmd_with(args):
 # ---------------------------------------------------------------------------
 # selftest（离线，含阴性对照）
 # ---------------------------------------------------------------------------
-def selftest():
+# ---------------------------------------------------------------------------
+# 分派表（**单一事实源**）：main 的 argparse 注册与 selftest 的断言都读它 ——
+# 避免"两处各写一份 if 链"而 selftest 只能验其中一份（这正是 ⑨ 那条缺陷当年的形状）。
+# ⚠️ 必须在 selftest 之前定义（selftest 第 ⑨ 项会读它）。
+# ---------------------------------------------------------------------------
+SUBCMDS = ("check", "status", "ensure", "with", "selftest")
+
+
+def selftest(_args=None):
+    """离线自证。接 `_args` 是为了能被 `_DISPATCH_TABLE` 统一分派（口径与 cmd_* 一致）。"""
     global preconditions            # ⑥ 需临时替换它做 fail-closed 对照（声明须在首次使用前）
     fails = []
     counter = {"n": 0}
@@ -412,9 +431,21 @@ def selftest():
         preconditions = _orig_pc
     _check(rc_stub == 4, "前置条件缺失 ⇒ with 返回 4（fail-closed，不启动任何进程）", "got %r" % rc_stub)
 
-    print("⑦ with 的 cmd 解析：前导 -- 必须被剥离，否则会把 -- 当命令跑")
+    print("⑦ `--` 切分：语义 = **只看第一个 `--`**（不再用贪婪的 REMAINDER）")
+    _g, _w = _split_double_dash(
+        ["with", "--timeout", "150", "--", "python", "x.py", "--", "selftest"])
+    _check(_g == ["with", "--timeout", "150"], "`--` 之前 = 网关侧参数", "got %r" % (_g,))
+    _check(_w == ["python", "x.py", "--", "selftest"],
+           "`--` 之后原样保留（含其中的 `--`，是命令自己的参数）", "got %r" % (_w,))
+    _g2, _w2 = _split_double_dash(["check"])
+    _check(_w2 is None, "无 `--` ⇒ 无被包装命令（不是空列表，语义可区分）", "got %r" % (_w2,))
+    # 阴性对照：旧写法 `with <命令>`（漏 `--`）必须 **不被** 认成合法包装
+    _g3, _w3 = _split_double_dash(["with", "selfcheck"])
+    _check(_w3 is None, "漏 `--` ⇒ 不产生被包装命令（阴性对照）", "got %r" % (_w3,))
+
+    print("⑦b with 的 cmd 解析：前导 -- 必须被剥离（兼容旧 Namespace 形态）")
     ns2 = argparse.Namespace(base=dead, timeout=0.1, cmd=["--", "--", "echo", "x"])
-    stripped = [c for c in ns2.cmd]
+    stripped = [c for c in (getattr(ns2, "wrapped", None) or ns2.cmd)]
     while stripped and stripped[0] == "--":
         stripped.pop(0)
     _check(stripped[0] == "echo", "多个前导 -- 全部剥离")
@@ -436,13 +467,92 @@ def selftest():
     import shutil as _sh
     _sh.rmtree(_d, ignore_errors=True)
 
+    print("⑨ 未知子命令不得静默 fall through 到 selftest（曾是真实缺陷）")
+    # ⚠️ 只对 **argparse 分派层** 下断言，**不递归调用 main(['selftest'])** ——
+    #    后者会再次进入本函数 ⇒ 无限递归（自检自己把自己跑死）。
+    _disp = _dispatch(argparse.Namespace(cmd="__nope__"))
+    _check(_disp == EXIT_MISCONFIG,
+           "未知子命令 ⇒ 退出码 4（fail-closed），而非落回 selftest", "got %r" % _disp)
+    # ⑩ 端到端：漏写 `--` 时，命令名被 argparse 当成非法子命令 ⇒ 解析期即 fail-closed。
+    #    ⚠️ 实际码是 **2**（argparse 的用法错误），不是 4 —— argparse 比 _dispatch 更早。
+    #    因此断言「**非 0** 且 stdout 零泄漏」，不钉死码：把"更早失败"误判成回归才是真错。
+    _e2e_argv = ["with", "selfcheck"]
+    _sink, _old_err, _old_out = io.StringIO(), sys.stderr, sys.stdout
+    sys.stderr = _sink
+    sys.stdout = _sink
+    try:
+        try:
+            _rc_e2e = main(_e2e_argv)
+        except SystemExit as _se:            # argparse 失败会 raise SystemExit
+            _rc_e2e = _se.code
+    finally:
+        sys.stderr, sys.stdout = _old_err, _old_out
+    _check(_rc_e2e not in (0, None),
+           "漏写 `--` ⇒ 非 0 退出（fail-closed，不得伪装成功）", "got %r" % _rc_e2e)
+    _check("项检查" not in _sink.getvalue(),
+           "漏写 `--` ⇒ **不**打 selftest 输出（阴性对照：这正是当年误判成「19 项全绿」的形状）",
+           "泄漏：%r" % _sink.getvalue()[:120])
+    # 阳性：selftest 分派仍指向 selftest 本体（用身份比较，不执行）
+    _check(_DISPATCH_TABLE.get("selftest") is selftest,
+           "selftest 子命令仍绑定到 selftest 本体（回归）")
+    # 分派表与 argparse 已注册的子命令必须一一对应（防"注册了却忘了接"）
+    _check(set(_DISPATCH_TABLE) == set(SUBCMDS),
+           "分派表键 == 已注册子命令集（无孤儿、无漏接）",
+           "diff=%r" % (set(_DISPATCH_TABLE) ^ set(SUBCMDS)))
+    _check(all(callable(f) for f in _DISPATCH_TABLE.values()),
+           "分派表每一项均可调用")
+
     print("\n[%s] laya_ensure selftest：%d 项检查，%d 失败"
           % ("PASS" if not fails else "FAIL", counter["n"], len(fails)))
     return 1 if fails else 0
 
 
 # ---------------------------------------------------------------------------
+# 分派表（**单一事实源**）—— 定义位置在 selftest 之后，但**只在运行时被引用**
+# （`selftest()` 第 ⑨ 项读它），模块加载完成时已就绪，无前向引用问题。
+# ⚠️ 若将来把 selftest 改成模块级副作用调用，必须先上移本表。
+# ---------------------------------------------------------------------------
+_DISPATCH_TABLE = {
+    "check": cmd_check,
+    "status": cmd_status,
+    "ensure": cmd_ensure,
+    "with": cmd_with,
+    "selftest": selftest,
+}
+
+
+def _dispatch(args):
+    """按 args.cmd 分派；**未知子命令一律 fail-closed 返回 4，绝不落回 selftest**。"""
+    fn = _DISPATCH_TABLE.get(args.cmd)
+    if fn is None:
+        print("[laya_ensure] 未知子命令：%r —— 可用：%s\n"
+              "  提示：`with` 的命令必须放在 `--` 之后，例如：\n"
+              "    laya_ensure.py with --timeout 150 -- <命令…>\n"
+              "  漏写 `--` 会让命令被当作子命令解析（本工具不代猜）。"
+              % (args.cmd, " / ".join(sorted(_DISPATCH_TABLE))), file=sys.stderr)
+        return EXIT_MISCONFIG
+    return fn(args)
+
+
+def _split_double_dash(argv):
+    """按**第一个** `--` 把 argv 切成 (网关侧参数, 被包装命令)。
+
+    ⚠️ 不可用 `argparse.REMAINDER` 承载被包装命令：REMAINDER 是**贪婪**的，
+    会把 `with --timeout 150 -- py -c x` 里的 `with` 也吞进位置参数，
+    导致 `args.cmd` 变成 list（实测 `TypeError: unhashable type: 'list'`），
+    或（旧版形状）子命令名被吃掉后 fall through 到 selftest。
+    这里显式切分，语义**只看第一个 `--`**，与 shell 的约定一致。
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--" not in argv:
+        return argv, None
+    i = argv.index("--")
+    return argv[:i], argv[i + 1:]
+
+
 def main(argv=None):
+    gateway_argv, wrapped = _split_double_dash(argv)
+
     p = argparse.ArgumentParser(description="Laya 可用性网关（探活 / 按需拉起 / 生命周期绑定）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -458,20 +568,31 @@ def main(argv=None):
     wp = sub.add_parser("with", help="拉到就绪后执行被包装命令，透传其退出码")
     wp.add_argument("--base", default=None)
     wp.add_argument("--timeout", type=float, default=180.0)
-    wp.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <命令…>")
 
     sub.add_parser("selftest", help="离线自证（含阴性对照）")
 
-    args = p.parse_args(argv)
-    if args.cmd == "check":
-        return cmd_check(args)
-    if args.cmd == "status":
-        return cmd_status(args)
-    if args.cmd == "ensure":
-        return cmd_ensure(args)
+    # 已注册子命令集必须与分派表一致（selftest ⑨ 会断言；此处 fail-fast 更早暴露）
+    assert set(sub.choices) == set(SUBCMDS), (
+        "argparse 注册的子命令 %r 与 SUBCMDS %r 不一致"
+        % (sorted(sub.choices), sorted(SUBCMDS)))
+
+    args = p.parse_args(gateway_argv)
+
     if args.cmd == "with":
-        return cmd_with(args)
-    return selftest()
+        # `with` 的被包装命令**只能**来自第一个 `--` 之后。
+        # 写成 `with <命令>`（漏 `--`）时 wrapped is None ⇒ 交给 _dispatch 报未知参数形态。
+        args.wrapped = [] if wrapped is None else wrapped
+        if wrapped is None:
+            print("[laya_ensure] `with` 缺少被包装命令：必须写成\n"
+                  "    laya_ensure.py with [--timeout s] -- <命令…>\n"
+                  "  `--` 之前是网关参数，之后是命令；本工具不代猜边界。", file=sys.stderr)
+            return EXIT_MISCONFIG
+    elif wrapped is not None:
+        print("[laya_ensure] `%s` 子命令不接受 `--` 之后的命令（只有 `with` 会包装命令）。"
+              % args.cmd, file=sys.stderr)
+        return EXIT_MISCONFIG
+
+    return _dispatch(args)
 
 
 if __name__ == "__main__":
