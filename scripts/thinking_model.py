@@ -323,7 +323,8 @@ def aggregate(dims, veto=None, ambiguity=False, amendments=None, *, tau=TAU, anc
 # 装配：契约 dict → plan.yaml 的 meta.思考判定 YAML 片段
 # ---------------------------------------------------------------------------
 def to_yaml_block(verdict, indent=2):
-    """产出可直接粘进 plan.yaml 的 `思考判定:` 片段（12 必填字段，顺序同 `THINKING_REQUIRED`）。
+    """产出可直接粘进 plan.yaml 的 `思考判定:` 片段（12 派生必填字段，顺序同 `THINKING_REQUIRED`；
+    另附 **1 个生成面子块** `前提审计`，v4.22.0 新增 —— 见 references/thinking-panel.md §5.6）。
 
     YAML 标量一律用 JSON 双引号形式（JSON 字符串是 YAML 双引号标量的子集）——
     这样含中文/括号/反斜杠的 `route_hint` 不需要手写转义。
@@ -345,6 +346,12 @@ def to_yaml_block(verdict, indent=2):
     lines.append(pad + "  main_judge: " + j(v["main_judge"]))
     lines.append(pad + "  laya: " + (j(v["laya"]) if v["laya"] is not None else "null"))
     lines.append(pad + "  route_hint: " + j(v["route_hint"]))
+    # v4.22.0：`前提审计` 子块（生成面 P2 的产出，**不是** derive 的产物）—— 给出合法空骨架供填写。
+    #   aggregate() 不产出它；缺省时 checks 只 WARN（软启动），填写则结构/自洽非法即 FAIL（D20–D22）。
+    lines.append(pad + "  前提审计:")
+    lines.append(pad + "    前提: []")
+    lines.append(pad + '    来源核实: {"需要核实": false, "已核实": [], "未核实": []}')
+    lines.append(pad + "    遗漏提醒: []")
     return "\n".join(lines)
 
 
@@ -593,8 +600,8 @@ def selftest(gold_path=None):
         parsed = yaml.safe_load(block)["思考判定"]
         _check(parsed["verdict"] == v["verdict"] and parsed["laya"] is None
                and abs(sum(parsed["distribution"].values()) - 1.0) < 1e-6
-               and len(parsed) == 12,
-               "to_yaml_block 可被 yaml 解析且回读一致（12 键）",
+               and len(parsed) == 13,
+               "to_yaml_block 可被 yaml 解析且回读一致（13 键 = 12 派生 + 前提审计）",
                "verdict=%s 键数=%d" % (parsed["verdict"], len(parsed)), fails)
     except ImportError:
         print("[SKIP] yaml 未安装 —— 跳过 YAML round-trip（不影响主流程）")
