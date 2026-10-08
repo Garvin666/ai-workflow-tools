@@ -64,6 +64,18 @@ JUDGE_B_FIELD = {
     "homework-judge": ("mode", True),
     "thinking-judge": ("verdict_probe", False),
 }
+# --- ★ 非 judge 来源（D2，2026-10-08）-------------------------------------------
+#     数模决策层（tools/mmdecide.py）的**同源影子采样**：同一份 state、同一批原子问题，
+#     分别问「代码基线」与「Laya」，产出 A/B 配对。它不是 ai-workflow 的某份 judge，
+#     而是**另一个消费方**在用同一个瓶颈（温度未校准 + 缺人工标），所以复用同一份
+#     样本文件与同一套分母纪律，但**必须用独立来源名**，避免与 judge 语义混淆：
+#       * `b_field` = 原子问题名（run_needs_review / model_selection / run_stability）
+#       * `comparable` = True（A/B 判的是同一份 state，可算一致率）
+SHADOW_SOURCES = {
+    "mmdecide-shadow": ("<按问题名逐条填>", True),
+}
+# 合法来源 = judge ∪ 非 judge 影子来源（下游一律读这个并集，不各自硬编码）
+ALL_SOURCES = {**JUDGE_B_FIELD, **SHADOW_SOURCES}
 # --- 分母纪律（同 thinking_model.agreement 的 D12/D13） -----------------------
 QUALIFIED_PROVENANCE = ("user_spot_checked", "human_verified")
 ALL_PROVENANCE = QUALIFIED_PROVENANCE + ("agent_seed", "disputed")
@@ -141,6 +153,60 @@ def parse_b(judge, raw):
         return None, "absent", laya.get("model_key"), laya.get("latency_ms"), "B 侧无 `%s` 字段" % field
     return (str(val).strip(), "ok", laya.get("model_key"),
             laya.get("latency_ms"), "")
+
+
+def build_shadow_record(source, question, a, b, state=None, rec_id=None,
+                        prob_a=None, prob_b=None, comp=None, run=None,
+                        file=None, task=None, keep_state=False, ts=None):
+    """构造一条**同源影子**样本（D2：数模决策层的 A/B 配对）。
+
+    与 ``build_record`` 的关键差异，以及**为什么必须分开**：
+
+    * ``build_record`` 的 B 值来自 **B 侧进程的 stdout**（``parse_b`` 解析 JSON）。
+      影子的 B 值来自**调用方内存里的 Answer 对象** —— 没有 JSON 可解，也没有
+      ``laya_status`` 可推。硬塞进 ``build_record`` 只会得到一个 ``b=None`` 的残废记录。
+    * 但**纪律必须一样**：``provenance`` 仍硬编码 ``agent_seed``（**本函数不接
+      provenance 参数** ⇒ 结构上没有冒充人工标的入口），``state`` 仍只落 sha1。
+
+    ``prob_a``/``prob_b`` 另存：一致率只看**取值**是否一致，但"两个都给了 0.9 却
+    内部分布完全不同"是真实存在的信息，丢掉就再也查不回来了。
+    """
+    if source not in SHADOW_SOURCES:
+        raise RecordError("未知影子来源：%s（可选 %s）"
+                          % (source, "/".join(SHADOW_SOURCES)))
+    if a is None or b is None:
+        # 半边缺席 ⇒ 不产配对。用 0.0 之类的占位会把"没测到"变成"测得一致"。
+        raise RecordError("影子配对要求 a/b 都在场（缺一边就没有对照可言）")
+    rec = {
+        "id": rec_id,
+        "judge": source,
+        "a": a,
+        "b": b,
+        "b_field": question,
+        "comparable": True,
+        "laya_status": "ok",
+        "model_key": MULTILINGUAL,          # 数模决策层已钉死 multilingual
+        "d16_violation": False,
+        "latency_ms": None,
+        "provenance": DEFAULT_PROVENANCE,   # ★ 硬编码：本函数没有 provenance 开关
+        "ts": ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": None,
+        "state_sha1": _state_sha1(state) if state else None,
+        "facts": {
+            "source": source,
+            "comp": comp,
+            "run": run,
+            "file": file,
+            "task": task,
+            "prob_a": prob_a,
+            "prob_b": prob_b,
+            "a_backend": "heuristic",
+            "b_backend": "laya",
+        },
+    }
+    if keep_state and state:
+        rec["state"] = state
+    return rec
 
 
 def build_record(judge, a, b_raw, state=None, provenance=None, rec_id=None,
@@ -309,6 +375,96 @@ def cmd_review(args):
     print("[review] 改 %d 条 / 拒 %d 条；现真实分母 n_qualified = %d（距 50 差 %d）"
           % (len(changed), len(refused), st["n_qualified"], st["gap_to_50"]))
     return 0 if changed else 2
+
+
+# ---------------------------------------------------------------------------
+# worksheet：把「待人工抽查」的样本摊成一份人能照着做的作业单
+# ---------------------------------------------------------------------------
+def cmd_worksheet(args):
+    """生成**人工抽查作业单**（D12/D13 出口条件的唯一人工入口的前置步骤）。
+
+    ⚠️ 本命令**只读**，不写任何 provenance —— 它把"该抽查什么"摆到人面前，
+    标不标由人决定。**刻意不提供 `--auto-approve`**：一键全标 = 伪造人工抽查。
+
+    为什么要它：`stats` 已经会把"缺的是人"接到 `review` 命令上，但从**看到命令**
+    到**能做出判断**之间还差一步 —— 人需要知道：这条样本问的是什么问题、A 说了什么、
+    B 说了什么、当时的输入指纹是什么、判"一致"到底该怎么判。没有这一步，
+    `review` 就成了"盲签"，而盲签出来的分母比 0 更糟（它看起来像有依据）。
+    """
+    data = load_samples(args.file)
+    recs = data.get("records") or []
+    pending = [r for r in recs
+               if r.get("provenance") == DEFAULT_PROVENANCE and r.get("comparable")]
+
+    lines = []
+    lines.append("# Laya 影子样本 · 人工抽查作业单")
+    lines.append("")
+    lines.append("> 本文件由 `laya_record.py worksheet` 生成（只读快照，不会自动更新）。")
+    lines.append("> **口径**：这里标的是「A 与 B 的取值是否一致」，**不是**「Laya 判得对不对」——")
+    lines.append("> 一致率 **不是准确率**（两者都不是，但混用会把结论说错）。")
+    lines.append("")
+    lines.append("| 项 | 值 |")
+    lines.append("| --- | --- |")
+    lines.append("| 样本文件 | `%s` |" % args.file)
+    lines.append("| 总记录 | %d |" % len(recs))
+    lines.append("| 可比对（comparable） | %d |" % sum(1 for r in recs if r.get("comparable")))
+    lines.append("| **待人工抽查**（本单工作面） | **%d** |" % len(pending))
+    lines.append("| 当前真实分母 n_qualified | %d |" % _stats(data)["n_qualified"])
+    lines.append("")
+    if not pending:
+        lines.append("## 没有待抽查的样本")
+        lines.append("")
+        lines.append("要么还没采到可比对样本（跑 `mmdecide --shadow` 或 `laya_record run`），")
+        lines.append("要么都已标过。**注意**：已标 ≠ 分母够 —— 出口条件还要 N ≥ 50。")
+    else:
+        lines.append("## 待抽查样本（逐条独立判断）")
+        lines.append("")
+        lines.append("**怎么判**：看 `a` 与 `b` 是否为同一取值。")
+        lines.append("取值一致 ⇒ 一致；不一致 ⇒ 不一致。**判的是这个，不是对错。**")
+        lines.append("")
+        for r in pending:
+            f = r.get("facts") if isinstance(r.get("facts"), dict) else {}
+            lines.append("### id=%s　`%s`%s" % (
+                r.get("id"), r.get("judge"),
+                ("　·　run=`%s`" % f.get("run")) if f.get("run") else ""))
+            lines.append("")
+            lines.append("- **问的问题**：`%s`" % (r.get("b_field") or "—"))
+            lines.append("- **A（代码基线）说**：`%r`%s" % (
+                r.get("a"),
+                ("　（概率 %.4f）" % f["prob_a"]) if isinstance(f.get("prob_a"), (int, float)) else ""))
+            lines.append("- **B（Laya）说**：`%r`%s" % (
+                r.get("b"),
+                ("　（概率 %.4f）" % f["prob_b"]) if isinstance(f.get("prob_b"), (int, float)) else ""))
+            lines.append("- **一致？**　%s" % ("**取值相同**" if r.get("a") == r.get("b") else "**取值不同**"))
+            lines.append("- **B 侧状态**：`%s`（model_key=`%s`，D16 违规=%s）" % (
+                r.get("laya_status"), r.get("model_key"), r.get("d16_violation")))
+            if f.get("file") or f.get("task") or f.get("comp"):
+                lines.append("- **输入指纹**：comp=`%s` task=`%s` file=`%s`" % (
+                    f.get("comp"), f.get("task"), f.get("file")))
+            if r.get("state_sha1"):
+                lines.append("- **state sha1**：`%s`（原文未落盘，这是可复算的锚）" % r["state_sha1"])
+            if r.get("ts"):
+                lines.append("- **采样时间**：%s" % r["ts"])
+            lines.append("")
+        lines.append("## 回填（每条单独给 id，无「全部标合格」）")
+        lines.append("")
+        lines.append("```bash")
+        lines.append("# 逐条：确认过 a/b 与输入指纹，且判断为「可信样本」才标")
+        lines.append("python scripts/laya_record.py review --file \"%s\" \\" % args.file)
+        lines.append("    --id <上表的 id> --verdict user_spot_checked --note \"<你的抽查依据>\"")
+        lines.append("```")
+        lines.append("")
+        lines.append("⚠️ 抽查依据请**具体**（例如「比对了 state_sha1 对应的 run 产物，a/b 取值确如记录」）——")
+        lines.append("写「已检查」等于没写。")
+
+    text = "\n".join(lines) + "\n"
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        print("[worksheet] %d 条待抽查 → %s" % (len(pending), args.out))
+    else:
+        print(text)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +899,55 @@ def selftest():
         except RecordError:
             _check(True, "%s 必须报错（阴性对照）" % why)
 
+    # ⑫ worksheet（D2/A）：作业单必须**真列出**待抽查项，且**不含**任何自动标路径
+    print("⑫ worksheet：只读作业单，列出待抽查项；结构上无「一键全标」")
+    import io as _io
+    f12 = _f("s12.json")
+    d12 = _empty()
+    # ⚠️ 必须用**有效的 B 侧 JSON** 造数据：b_raw=None 会让 laya_status=absent、
+    #    comparable=False ⇒ 样本压根不进待抽查区，测试就会假绿（首版踩过）。
+    d12["records"].append(build_record("self-judge", "code", good_b, rec_id=101))
+    d12["records"].append(build_record("thinking-judge", "修正", think_b, rec_id=102))
+    d12["records"].append(build_record("self-judge", "code", good_b, rec_id=103,
+                                       provenance="user_spot_checked"))
+    save_samples(f12, d12)
+    _buf, _old = _io.StringIO(), sys.stdout
+    sys.stdout = _buf
+    try:
+        _rc_ws = cmd_worksheet(argparse.Namespace(file=f12, out=None))
+    finally:
+        sys.stdout = _old
+    _txt = _buf.getvalue()
+    _check(_rc_ws == 0, "worksheet 正常返回 0", "got %r" % _rc_ws)
+    # 前提校验：数据里确实有可比对样本（否则下面几条是空跑，会假绿）
+    _n_comp = sum(1 for r in load_samples(f12)["records"]
+                  if r.get("comparable") and r.get("provenance") == DEFAULT_PROVENANCE)
+    _check(_n_comp >= 1, "前提：测试数据含可比对且未标的样本", "n=%d" % _n_comp)
+    _check("## 待抽查样本" in _txt and "id=101" in _txt,
+           "作业单列出待抽查项（含 id）", _txt[:160].replace("\n", "|"))
+    _check("id=103" not in _txt.split("## 回填")[0],
+           "已标样本（user_spot_checked）不出现在待抽查区（阴性对照）")
+    _check("**取值相同**" in _txt or "**取值不同**" in _txt,
+           "逐条给出「一致？」的**机器预判**（人只需复核，不从零判）")
+    _check("--verdict user_spot_checked" in _txt, "作业单给出具体回填命令")
+    _check("auto-approve" not in _txt and "全部标" not in _txt.replace("无「全部标合格」", ""),
+           "作业单**不含**任何一键全标入口（结构上堵死）")
+    # 子命令分派：未知子命令不得落回 selftest（同 laya_ensure ⑨ 的缺陷形态）。
+    # ⚠️ argparse 会先 raise SystemExit(2)（比我们的分支更早）⇒ 断言「非 0」而非钉死 2。
+    _buf2, _old2, _old2e = _io.StringIO(), sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _buf2, _buf2
+    try:
+        try:
+            _rc_unknown = main(["__nope__"])
+        except SystemExit as _se:
+            _rc_unknown = _se.code
+    finally:
+        sys.stdout, sys.stderr = _old2, _old2e
+    _check(_rc_unknown not in (0, None),
+           "未知子命令 ⇒ 非 0 退出（不得落回 selftest）", "got %r" % _rc_unknown)
+    _check("项检查" not in _buf2.getvalue(),
+           "未知子命令 ⇒ **不**打 selftest 输出（阴性对照）")
+
     shutil.rmtree(tmpdir, ignore_errors=True)
     # 汇总语由计数器生成，**不硬编码项数**（硬编码会在增删检查项时静默失真）
     print("\n[%s] laya_record selftest：%d 项检查，%d 失败"
@@ -783,6 +988,11 @@ def main(argv=None):
     rv.add_argument("--verdict", default="user_spot_checked", choices=sorted(ALL_PROVENANCE))
     rv.add_argument("--note", default=None, help="抽查依据（建议填写，落进 review_note）")
 
+    ws = sub.add_parser("worksheet", help="生成人工抽查作业单（只读；把「该抽查什么」摊给人看）")
+    ws.add_argument("--file", required=True)
+    ws.add_argument("--out", default=None, help="写到文件；缺省打 stdout")
+    # ⚠️ 刻意**不提供** --auto-approve / --all：一键全标 = 伪造人工抽查
+
     rn = sub.add_parser("run", help="一条命令完成采样：探活 → 跑 B 侧 → 与 --a 配对 → 落盘")
     rn.add_argument("--file", required=True, help="样本文件（**不设默认**：默认路径会掩盖写错位置）")
     rn.add_argument("--judge", default=None, choices=sorted(JUDGE_B_FIELD),
@@ -813,9 +1023,16 @@ def main(argv=None):
         return cmd_export(args)
     if args.cmd == "review":
         return cmd_review(args)
+    if args.cmd == "worksheet":
+        return cmd_worksheet(args)
     if args.cmd == "run":
         return cmd_run(args)
-    return selftest()
+    if args.cmd == "selftest":
+        return selftest()
+    # 未知子命令：**不得**静默 fall through 到 selftest（同 laya_ensure 的 ⑨ 号缺陷）
+    print("[laya_record] 未知子命令：%r —— 可用：append / stats / export / review / "
+          "worksheet / run / selftest" % (args.cmd,), file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
