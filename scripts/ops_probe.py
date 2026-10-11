@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""[自研工具] ops_probe.py —— 每日运维四支巡检（量化平台）
-
-名称：ops_probe.py
-用途：按设计案 `报告-每日自动运维方案-20261011.md` §2.2 实现四支**互相独立、各自定时**的巡检，
-      并把结论落成结构化产物，供 23:30 的 `ops_report.py` 折入当日日报与告警流水。
-适用场景：本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维；也适用于任何
-      「需要按不同时刻分批巡检、但结论最终汇总到一份日报」的本地运维场景。
-仓库链接：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_probe.py
+# [自研工具] ops_probe.py
+# 用途：每日运维四支巡检（量化平台）—— 按设计案 `报告-每日自动运维方案-20261011.md` §2.2 实现四支互相独立、各自定时的巡检，并把结论落成结构化产物，供 23:30 的 `ops_report.py` 折入当日日报与告警流水
+# 适用场景：本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维；也适用于任何「需要按不同时刻分批巡检、但结论最终汇总到一份日报」的本地运维场景
+# 作者：ai-workflow 自研（量化平台运维沉淀，2026-10-11）
+# 仓库：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_probe.py
+"""ops_probe.py —— 每日运维四支巡检（量化平台）
 
 四支巡检
 --------
