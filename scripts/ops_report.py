@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""[自研工具] ops_report.py —— 每日运维日报与告警登记器（量化平台）
+# [自研工具] ops_report.py
+# 用途：每日运维日报与告警登记（量化平台）—— 汇总站点自愈/数据链路调度/调度自检/外设守护当日状态，产出七段日报与三级（P0/P1/P2）告警流水，并折入四支巡检结论
+# 适用场景：本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维收尾（建议 23:30）；也适用于任何「状态散落在多套机制的日志/状态文件里、需要每天翻一遍」的巡检场景
+# 作者：ai-workflow 自研（量化平台运维沉淀，2026-10-11）
+# 仓库：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_report.py
+"""ops_report.py —— 每日运维日报与告警登记器（量化平台）
 
 用途
 ----
@@ -13,10 +18,6 @@
 --------
 本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维收尾（建议 23:30），
 以及任何「状态散落在多套机制的日志/状态文件里、需要每天翻一遍」的巡检场景。
-
-仓库链接
---------
-https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_report.py
 
 ⚠️ 能力边界（刻意不实现）
 ------------------------
