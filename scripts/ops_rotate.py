@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""[自研工具] ops_rotate.py —— 每日运维产物轮转器（量化平台）
+# [自研工具] ops_rotate.py
+# 用途：每日运维产物轮转器（量化平台）—— 按保留期清理「本系统自己生成、且名字里带完整日期」的每日产物，白名单容器式（只删白名单形状，保护清单优先），默认 dry-run
+# 适用场景：本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维收尾（建议 23:45，排在日报之后）；也适用于任何「按日期命名的每日产物需要控制留存」的运维目录
+# 作者：ai-workflow 自研（量化平台运维沉淀，2026-10-11）
+# 仓库：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_rotate.py
+"""ops_rotate.py —— 每日运维产物轮转器（量化平台）
 
 用途
 ----
@@ -11,10 +16,6 @@
 --------
 本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维收尾（建议 23:45，排在日报之后），
 以及任何「按日期命名的每日产物需要控制留存」的运维目录。
-
-仓库链接
---------
-https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_rotate.py
 
 ⚠️ 能力边界（刻意不实现）
 ------------------------
