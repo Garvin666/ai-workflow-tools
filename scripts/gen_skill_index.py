@@ -42,10 +42,19 @@
 已知边界（如实登记）：这与"同秒内同长度改动"无关了 —— 纯内容指纹对任何字节差异都敏感；
 唯一的代价是 `--check` 要读一遍各 `SKILL.md`（本机 25 份共 ≈200 KB，毫秒级，可接受）。
 
+⭐ v4.32.1 修的是一条**判据同源缺陷**（2026-10-11 实测复现）：指纹由**根集**决定，而旧版
+`--check` 用的是「**调用方传入的**根」重算 ⇒ 生成时带 `--workspace`、校检时不带（或反之）
+就**恒判过期**（实测：双根生成的索引被裸 `--check` 判 STALE，哪怕它一字节没改）。索引只有
+一份，「两种根集不可能同时绿」——这不是保守，是判据本身没定义清楚「该按谁的根算」。
+修法：① 索引头部加机器可读标记 `<!-- roots: … -->` ② 未显式指定根时**从索引读回根集**再校检
+③ 旧索引（无标记）回退解析人类行「扫描根：」④ 显式指定的根与索引记录不一致时给 WARN。
+⇒ 现在**裸 `--check` 对任何版本的索引都自洽**；显式指定仍可覆盖（用于「我就是想按别的根看」）。
+
 用法：
     python scripts/gen_skill_index.py                      # 生成并写入默认索引
     python scripts/gen_skill_index.py --print              # 只打印，不写盘
     python scripts/gen_skill_index.py --check              # 新鲜度校检（只读，退出码 0/1/2）
+                                                          #   未显式给根 ⇒ 按索引记录的根集校检（v4.32.1）
     python scripts/gen_skill_index.py --index <路径> --roots <根1>,<根2>
 
 退出码：0 = 成功/新鲜；1 = --check 判过期或索引缺失；2 = 用法或环境错误
@@ -264,6 +273,7 @@ def render(entries: list[dict], roots: list[Path], partition: bool = True) -> st
         "# 技能库索引（由 `gen_skill_index.py` 自动生成，请勿手改）",
         "",
         f"<!-- fp: {fingerprint(roots)[0]} -->  源集合**内容**指纹（不含 mtime）；`--check` 就是拿它与实时值比对",
+        f"<!-- roots: {'|'.join(str(r) for r in roots)} -->  生成时用的扫描根（**机器可读**；`--check` 未显式指定根时按此校检）",
         f"> 生成时间：{time.strftime('%Y-%m-%d %H:%M')} ｜ 技能数：**{len(entries)}**（自动跳过 `_backup-*` / `*.bak*` / `*.backup*` / `_archive` / `.git` / 点开头）",
         f"> 扫描根：{'；'.join(str(r) for r in roots)} ｜ 文件位置：各技能的 `<根>/<目录名>/SKILL.md`",
         "> **读法（阶段 0）**：先在本表**按簇**定位候选 → **只读命中候选的 `SKILL.md` frontmatter** →",
@@ -357,20 +367,78 @@ def fingerprint(roots: list[Path]) -> tuple[str, int]:
 
 
 FP_RE = re.compile(r"<!--\s*fp:\s*([0-9a-f]{8,})\s*-->")
+ROOTS_RE = re.compile(r"<!--\s*roots:\s*(.*?)\s*-->")
+# 人类行回退用：`> 扫描根：p1；p2 ｜ 文件位置：…`
+ROOTS_HUMAN_RE = re.compile(r"^>\s*扫描根：(.+?)\s*｜", re.M)
+
+
+def read_roots_from_index(index: Path) -> tuple[list[Path] | None, str]:
+    """从索引里读回**生成时用的根集**（v4.32.1 新增）。
+
+    为什么需要：`--check` 若用「调用方传入的根」重算指纹，而索引内容又依赖根集，
+    则生成与校检一旦不同源就**恒判过期**（2026-10-11 实测：双根生成的索引被裸 `--check`
+    判 STALE）。⇒ 让索引**自己记住**根集，校检时按它重算，与调用方怎么传解耦。
+
+    两级读取，都是索引里已有的信息：① 机器标记 `<!-- roots: p1|p2 -->`（本版新增，优先）
+    ② 人类行 `> 扫描根：p1；p2 ｜ …`（旧索引兼容）。取不到返回 `(None, 原因)`。
+    """
+    if not index.is_file():
+        return None, "索引文件不存在"
+    text = index.read_text(encoding="utf-8", errors="replace")[:4000]
+    m = ROOTS_RE.search(text)
+    if m:
+        parts = [p.strip() for p in m.group(1).split("|") if p.strip()]
+        if parts:
+            return [Path(p) for p in parts], "索引机器标记 <!-- roots: … -->"
+    m2 = ROOTS_HUMAN_RE.search(text)
+    if m2:
+        parts = [p.strip() for p in m2.group(1).split("；") if p.strip()]
+        if parts:
+            return [Path(p) for p in parts], "索引人类行『扫描根：』（旧版兼容）"
+    return None, "索引未记录根集（既无机器标记也无人类行）"
+
+
+def _stored_fp(index: Path) -> str | None:
+    """取索引里存的指纹；取不到返回 None。"""
+    if not index.is_file():
+        return None
+    m = FP_RE.search(index.read_text(encoding="utf-8", errors="replace")[:4000])
+    return m.group(1) if m else None
 
 
 def is_fresh(index: Path, roots: list[Path]) -> tuple[bool, str]:
-    """比对「索引里存的指纹」与「当前源集合指纹」。"""
+    """比对「索引里存的指纹」与「**调用方传入的**根集算出的指纹」（显式指定根时走这条）。"""
     if not index.is_file():
         return False, "索引文件不存在：%s" % index
-    m = FP_RE.search(index.read_text(encoding="utf-8", errors="replace")[:2000])
-    if not m:
+    stored = _stored_fp(index)
+    if not stored:
         return False, "索引里没有指纹标记（可能是旧版或手改过）→ 请重建"
     cur, n = fingerprint(roots)
-    stored = m.group(1)
     if cur != stored:
         return False, "源集合已变化（存 %s / 现 %s）" % (stored, cur)
     return True, "内容指纹一致（%s），%d 个技能目录" % (stored, n)
+
+
+def is_fresh_auto(index: Path) -> tuple[bool, str]:
+    """未显式指定根时的校检：按**索引自己记录的根集**重算（v4.32.1 修复根集同源缺陷）。
+
+    与 `is_fresh` 只差一处：根集从索引里读，而不是从调用方拿 —— 这样
+    「生成时带 `--workspace`、校检时不带」不再误判，索引只有一份也能自洽。
+    索引没记录根集时**回退**到默认根（保持旧行为），并在结论里写明这是回退、可能不同源。
+    """
+    if not index.is_file():
+        return False, "索引文件不存在：%s" % index
+    stored = _stored_fp(index)
+    if not stored:
+        return False, "索引里没有指纹标记（可能是旧版或手改过）→ 请重建"
+    roots, src = read_roots_from_index(index)
+    if roots is None:
+        roots = list(DEFAULT_ROOTS)
+        src = "回退：%s ⇒ 按默认根比对（可能与生成时不同源）" % src
+    cur, n = fingerprint(roots)
+    if cur != stored:
+        return False, "源集合已变化（存 %s / 现 %s）｜根集来源：%s" % (stored, cur, src)
+    return True, "内容指纹一致（%s），%d 个技能目录 ｜ 根集来源：%s" % (stored, n, src)
 
 
 def main() -> int:
@@ -379,7 +447,9 @@ def main() -> int:
     ap.add_argument("--roots", help="扫描根，逗号分隔（默认用户级 ~/.workbuddy/skills）")
     ap.add_argument("--workspace", help="额外把 <工作区>/.workbuddy/skills 纳入扫描根（项目级技能）")
     ap.add_argument("--print", dest="print_only", action="store_true", help="只打印，不写盘")
-    ap.add_argument("--check", action="store_true", help="只校检新鲜度（只读），过期/缺失以 1 退出")
+    ap.add_argument("--check", action="store_true",
+                    help="只校检新鲜度（只读），过期/缺失以 1 退出；未显式指定 --roots/--workspace 时"
+                         "按**索引自己记录的根集**校检（v4.32.1）")
     a = ap.parse_args()
 
     roots = [Path(p.strip()) for p in a.roots.split(",")] if a.roots else list(DEFAULT_ROOTS)
@@ -388,7 +458,16 @@ def main() -> int:
     index = Path(a.index)
 
     if a.check:
-        fresh, why = is_fresh(index, roots)
+        # v4.32.1：未显式指定根时按**索引自己记录的根集**校检（修复「根集不同源恒判过期」）。
+        explicit = bool(a.roots) or bool(a.workspace)
+        if explicit:
+            fresh, why = is_fresh(index, roots)
+            rec, _src = read_roots_from_index(index)
+            if rec is not None and [str(r) for r in rec] != [str(r) for r in roots]:
+                print("[WARN] 本次**显式指定**的根集与索引记录的**不一致** —— 判 STALE 属预期行为；"
+                      "索引记录的根集：" + "；".join(str(r) for r in rec), file=sys.stderr)
+        else:
+            fresh, why = is_fresh_auto(index)
         print(("[OK  ] 索引新鲜：" if fresh else "[STALE] 索引不可用：") + why)
         if not fresh:
             print("[HINT] 重跑：python scripts/gen_skill_index.py" + (f" --workspace {a.workspace}" if a.workspace else ""))
