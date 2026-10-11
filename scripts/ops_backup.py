@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""[自研工具] ops_backup.py —— 每日分层备份器（量化平台）
+# [自研工具] ops_backup.py
+# 用途：每日分层备份器（量化平台）—— SQLite 走在线备份 API、小文件走复制、大文件走同盘硬链接，产出带 sha256 清单的 manifest.json
+# 适用场景：本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维备份窗口（建议 23:15）；也适用于任何「目标盘余量紧张、大文件不宜逐日全量复制」的同盘备份场景
+# 作者：ai-workflow 自研（量化平台运维沉淀，2026-10-11）
+# 仓库：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_backup.py
+"""ops_backup.py —— 每日分层备份器（量化平台）
 
 用途
 ----
@@ -11,10 +16,6 @@
 --------
 本工作区（E:/ChatGPT/量化分析与数据分析）的每日运维备份窗口（建议 23:15），
 以及任何「目标盘余量紧张、大文件不宜逐日全量复制」的同盘备份场景。
-
-仓库链接
---------
-https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/ops_backup.py
 
 为什么分层（实测依据，2026-10-11）
 --------------------------------
