@@ -91,8 +91,8 @@ def _own_code(code: str) -> bool:
     （T10 的公网核验、T8 的跨日 streak、T7 的日历不可用）。
     这是「同一物理量必须同源」在**时序**上的延伸：同源还不够，还要取**同一时刻**的那一份。
     """
-    if code in {"site_down", "disk_critical", "disk_low", "log_volume", "close_no_record",
-                "slot_failed", "slot_degraded", "silent_days"}:
+    if code in {"site_down", "disk_critical", "disk_low", "host_disk_low", "log_volume",
+                "close_no_record", "slot_failed", "slot_degraded", "silent_days"}:
         return True
     if code.startswith("backup_") or code.startswith("drift"):
         return True
@@ -275,8 +275,20 @@ def build_alerts(day: str, site_probes: list[dict], probes: dict[str, Any],
             add("P0", "disk_critical", "host", f"{d['label']} 可用仅 {pct}%（< {DISK_CRIT_PCT}%）",
                 f"free {d['free_gb']} GB / total {d['total_gb']} GB", subject=d["label"])
         elif pct < DISK_WARN_PCT:
-            add("P1", "disk_low", "host", f"{d['label']} 可用 {pct}%（< {DISK_WARN_PCT}%）",
-                f"free {d['free_gb']} GB / total {d['total_gb']} GB", subject=d["label"])
+            # ⚠️ 告警级别是「可处置性」的函数，不是「远离阈值的程度」的函数。
+            #    设计案 §2.2 的 15%/8% 原文写给**系统盘**；同一组阈值套到**工作区所在盘**上，
+            #    会出现一条本方无法处置的**永久 P1**（删光整个工作区也只从 11.5% 拉到 13.5%），
+            #    而 `verdict_of` 是集合判定 ⇒ 任一 P1 即「注意」，一条永久 P1 把三态压成两态。
+            #    ⇒ 只对**系统盘**保持 P1（原样）；工作区所在盘降 P2（知情项，不进 verdict）。
+            #    ⚠️ 两个阈值常量与 `if pct < DISK_CRIT_PCT` 分支**均原样不动** —— P0 红线两盘共用。
+            #    ⚠️ `scripts/ops_probe.py::check_resource` 是同一判据的**第二份实现**，必须同步改。
+            if d["label"] == "系统盘":
+                add("P1", "disk_low", "host", f"{d['label']} 可用 {pct}%（< {DISK_WARN_PCT}%）",
+                    f"free {d['free_gb']} GB / total {d['total_gb']} GB", subject=d["label"])
+            else:
+                add("P2", "host_disk_low", "host",
+                    f"{d['label']} 可用 {pct}%（< {DISK_WARN_PCT}%，非系统盘 ⇒ 知情项）",
+                    f"free {d['free_gb']} GB / total {d['total_gb']} GB", subject=d["label"])
 
     # 日志体量：⚠️ 只对**日志目录**生效（`is_log`）—— 把「日志目录 > 2 GB」套到源码/备份目录上
     #    是口径外扩；备份目录名义值可轻松过 2 GB，那会变成一个与判据本意无关的告警。
@@ -526,6 +538,29 @@ def render_report(day: str, alerts: list[dict], site_probes: list[dict],
         exc = d.get("excluded") or []
         exc_txt = "；".join(f"{e['name']} {e['mb']}MB/{e['files']}文件" for e in exc) if exc else "—"
         L.append(f"| {d['label']} | {d['mb']} | {d['files']} | {exc_txt} |\n")
+    # 工作区级预算（2026-10-11 追加）—— **只渲染，不判定**：判定在 T1 巡检里（唯一实现），
+    # 日报靠产物折入。⚠️ 刻意不在日报重算：全盘遍历实测 100+ 秒，而体积是慢变量，
+    # 07:00 的读数在 23:30 依然有效。
+    _ws = _r.get("workspace") or {}
+    if _ws.get("error"):
+        L.append(f"\n> ⚠️ 工作区体量扫描失败：`{_ws['error']}` —— **不是「未超标」**。\n")
+    elif _ws:
+        L.append(f"\n**工作区合计 {_ws.get('mb')} MB / {_ws.get('files')} 文件**"
+                 f"（硬链接已去重；另 {_ws.get('dup_inode_files')} 个重复 inode、"
+                 f"{_ws.get('dup_mb')} MB 未重复计入）\n")
+        rows = _ws.get("budget_rows") or []
+        if rows:
+            L.append("\n| 目录 | 体量(MB) | 预算(MB) | 占比 | 状态 |\n|---|---|---|---|---|\n")
+            for r in rows:
+                if not r.get("exists"):
+                    L.append(f"| {r['label']} | — | {r['budget_mb']:.0f} | — | 目录不存在（**不判**）|\n")
+                    continue
+                mark = "⚠️ 超预算" if r.get("over") else "ok"
+                L.append(f"| {r['label']} | {r['mb']} | {r['budget_mb']:.0f} | "
+                         f"{r['pct']}% | {mark} |\n")
+            L.append("\n> 预算为**初值**（留 25%+ 余量），定位是抓**失控增长**（翻倍级），"
+                     "不是抓「比昨天多一点点」——若初值就设成「今天已超标」，只会再造一条永久 P1。\n")
+
     if not _r:
         L.append("\n> ⚠️ T1 巡检产物缺失：上表为日报内置口径（目录集与 T1 不同，且**无内存/进程/句柄采集**）。\n")
     else:
