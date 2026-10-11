@@ -187,6 +187,153 @@ def _dir_stats() -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# 工作区级预算（2026-10-11 追加）
+# --------------------------------------------------------------------------- #
+#: 为什么需要独立于「宿主盘判据」：
+#:   `_disk_stats()` 只能回答「盘要满了」，回答不了「是不是**我们自己**在膨胀」。
+#:   实测 E: 上工作区仅占该盘已用的 1.8% ⇒ 宿主盘告警对本方的动作**不可处置**；
+#:   真正可处置的信号是**工作区/目录自身的绝对体量**（删中间产物、轮转、清临时区）。
+#:
+#: ⚠️ 阈值是**初值**，刻意留 25%+ 余量（2026-10-11 实测：总量 14.44 GB / 历史数据集
+#:    10.66 GB / tasks 1.34 GB / `.scratch` 1.17 GB / backup 0.50 GB / `.work` 0.50 GB /
+#:    daily_output 34 MB）。若初值就设成「今天已超标」，只会**再造一条永久 P1** ——
+#:    正是本任务要治的病。初值定位＝抓**失控增长**（翻倍级），不是抓「比昨天多一点点」。
+#:    校准口径：两周后按实际增长速率复校（与设计案 §7 第 4 条同一条纪律）。
+#: 口径：`(展示名, 相对工作区根的路径, 预算 MB)`；路径为 `""` 表示**工作区总量**。
+WS_BUDGET_MB = (
+    ("工作区总量", "", 18 * 1024),
+    ("历史数据集", "历史数据集", 13 * 1024),
+    ("tasks", "tasks", 3 * 1024),
+    (".scratch", ".scratch", 2 * 1024),
+    (".work", ".work", 1024),
+    ("backup", "backup", 1024),
+    ("daily_output", "daily_output", 150),
+)
+
+#: 遍历时**在层里**剪掉的目录名 —— 依赖树/缓存不剪会把真实体量淹没
+WS_SKIP_DIRNAMES = frozenset({".git", "node_modules", "__pycache__", ".venv", ".mypy_cache"})
+
+WS_BUDGET_CODE = "ws_budget_exceeded"
+
+
+def ws_scan(root: Path | None = None) -> dict[str, Any]:
+    """工作区体量：**单次遍历 + 全局 inode 去重**，按顶层目录归因。
+
+    ⚠️ 三处必须做对（本任务实测踩中，写错都**不抛异常、只算错数**）：
+    ① **硬链接去重必须在整个工作区范围内做一次** —— `backup/` 与 `历史数据集/` 共享 1 个
+       inode（实测 0.474 GB）；逐目录各开一个 `seen` 集会把**总量**多算 3.2%。
+    ② 用 `os.scandir` 而不是 `os.walk` + `os.stat`：Windows 上 `DirEntry.stat()` 直接复用
+       目录枚举缓存，省掉每文件一次 syscall。**但它只可信 `st_size`** —— `st_nlink`/`st_ino`
+       在 Windows 上恒为 0（实测 Py3.12），必须回落 `os.stat` 才拿得到 inode 身份。
+    ③ `.venv`/`node_modules`/`__pycache__` 必须在**遍历层**剪掉（不是算完再减）。
+    ④ **遍历顺序必须确定（按名排序）**：跨目录共享的 inode 只能归给「先遇到的那个目录」，
+       而 `os.scandir` 的枚举顺序**不保证**稳定 ⇒ 不排序会让同一次体量在两次运行里
+       落到不同的目录上（`backup` 与 `历史数据集` 共享 0.474 GB，归属会来回跳）。
+       注意这是**口径本身的固有歧义**（一个 inode 只有一个体积，却有两个目录名），
+       排序只是让它**可复现**；总量不受影响。
+    """
+    base = Path(root) if root is not None else PROJECT_ROOT
+    seen: set[tuple[int, int]] = set()
+    per_bytes: dict[str, int] = {}
+    per_files: dict[str, int] = {}
+    total = files = dup_files = dup_bytes = unreadable = 0
+    stack: list[tuple[Path, str]] = [(base, "")]
+    while stack:
+        cur, top = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            unreadable += 1
+            continue
+        # 子目录**逆序入栈** ⇒ 出栈顺序 = 名字升序（栈是 LIFO），保证 DFS 顺序确定
+        subdirs: list[tuple[Path, str]] = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if e.name in WS_SKIP_DIRNAMES:
+                        continue
+                    subdirs.append((Path(e.path), top or e.name))
+                    continue
+                st = e.stat(follow_symlinks=False)
+                # 🔴 Windows（实测 Py3.12）上 `DirEntry.stat()` 的 `st_nlink`/`st_ino` **恒为 0**，
+                #    只有 `st_size` 可信。直接拿它去重 ⇒ 去重**变成空操作**：不抛异常、
+                #    总量静默多算 3.2%（本仓实测 0.474 GB）。
+                #    故缺 inode 身份时回落 `os.stat`（多一次 syscall，是正确性的代价）。
+                if st.st_nlink == 0 or st.st_ino == 0:
+                    st = os.stat(e.path, follow_symlinks=False)
+            except OSError:
+                unreadable += 1
+                continue
+            files += 1
+            per_files[top] = per_files.get(top, 0) + 1
+            if st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    # 同一 inode 的**第二个**链接：体积已归首次遇到的那一份 ⇒ 只记重复数
+                    dup_files += 1
+                    dup_bytes += st.st_size
+                    continue
+                seen.add(key)
+            total += st.st_size
+            per_bytes[top] = per_bytes.get(top, 0) + st.st_size
+        stack.extend(reversed(subdirs))
+    return {
+        "mb": round(total / 1024 / 1024, 2), "files": files,
+        "dup_inode_files": dup_files, "dup_mb": round(dup_bytes / 1024 / 1024, 2),
+        "unreadable": unreadable,
+        # ⚠️ 键集取 `per_bytes` ∪ `per_files`：若某目录的字节**全部**来自重复 inode，
+        #    它的体积为 0 ⇒ 只按 per_bytes 建键会让该目录**整体消失**，
+        #    而下游把「查不到」读成「目录不存在」⇒ **静默漏判**。
+        "dirs": {k: {"mb": round(per_bytes.get(k, 0) / 1024 / 1024, 2),
+                     "files": per_files.get(k, 0)}
+                 for k in sorted(set(per_bytes) | set(per_files),
+                                 key=lambda k: -per_bytes.get(k, 0))},
+    }
+
+
+def ws_budget_rows(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    """预算表 —— **唯一实现**：日报里展示的「占比」与触发告警用的那个数**必然同源**。
+
+    ⚠️ 若把「展示」与「判定」写成两处，就又造出一对「同一物理量两处实现」
+       （本仓已经吃过一次：磁盘判据日报/巡检各写一份，漏改一份就各说一套）。
+    ⚠️ 目录不存在 ⇒ `exists=False`、`mb=None`，**不参与判定**：这不是「通过」。
+    """
+    dirs = scan.get("dirs") or {}
+    rows = []
+    for label, key, budget_mb in WS_BUDGET_MB:
+        node = scan if key == "" else (dirs.get(key) or None)
+        cur = node.get("mb") if node else None
+        rows.append({
+            "label": label, "key": key, "budget_mb": budget_mb,
+            "mb": cur, "files": (node or {}).get("files"),
+            "pct": round(cur / budget_mb * 100, 1) if cur is not None else None,
+            "over": bool(cur is not None and cur > budget_mb),
+            "exists": cur is not None,
+        })
+    return rows
+
+
+def ws_budget_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    """工作区级预算判定 —— 由 `ws_budget_rows` 派生（**不另算一遍**）。
+
+    ⚠️ 与 `ops_report._own_code` 的约定：`ws_budget_exceeded` **不得**登记为「日报自有 code」——
+       本判据只在巡检里实现，日报通过**折入**拿到（否则日报要重算一遍 100+ 秒的全盘遍历）。
+       体积是**慢变量**：07:00 的读数在 23:30 依然有效，故不适用「取同一时刻那一份」的顾虑。
+    """
+    out = []
+    for r in ws_budget_rows(scan):
+        if not r["over"]:
+            continue
+        path = PROJECT_ROOT if r["key"] == "" else PROJECT_ROOT / r["key"]
+        out.append(finding(
+            "P1", WS_BUDGET_CODE, "host", r["label"],
+            f"{r['label']} 体积 {r['mb']:.1f} MB（> 预算 {r['budget_mb']:.0f} MB，{r['pct']:.0f}%）",
+            f"{path}｜预算为初值，见 tasks/T1磁盘判据按盘分流-2026-10-11/方案评审.md"))
+    return out
+
+
 def _memory() -> dict[str, Any]:
     """零依赖取物理内存。⚠️ 64 位陷阱：`GetCurrentProcess` 若用默认 restype=c_int，
     伪句柄会被截断（本任务实测句柄采集返回 -1 即此因）；本函数只用 Structure，不受影响。"""
@@ -294,14 +441,37 @@ def check_resource(day: str) -> dict[str, Any]:
                                      f"{d['label']} 可用仅 {pct}%（< {DISK_CRIT_PCT}%）",
                                      f"free {d['free_gb']} GB / total {d['total_gb']} GB")])
         elif pct < DISK_WARN_PCT:
-            add_findings(r, [finding("P1", "disk_low", "host", d["label"],
-                                     f"{d['label']} 可用 {pct}%（< {DISK_WARN_PCT}%）",
-                                     f"free {d['free_gb']} GB / total {d['total_gb']} GB")])
+            # ⚠️ 与 `scripts/ops_report.py::build_alerts` 的磁盘段是**同一判据的第二份实现**，
+            #    必须**逐字同源改**（本仓暂无跨文件同源守卫）——漏改一处会让巡检产物仍写 P1，
+            #    日报折入后 verdict 又被拉回「注意」，等于白改。
+            #    分流依据：设计案 §2.2 的 15%/8% 是写给**系统盘**的；工作区所在盘降 P2（不进 verdict）。
+            #    两个阈值常量与 `if pct < DISK_CRIT_PCT` 分支**均原样不动** —— P0 红线两盘共用。
+            if d["label"] == "系统盘":
+                add_findings(r, [finding("P1", "disk_low", "host", d["label"],
+                                         f"{d['label']} 可用 {pct}%（< {DISK_WARN_PCT}%）",
+                                         f"free {d['free_gb']} GB / total {d['total_gb']} GB")])
+            else:
+                add_findings(r, [finding("P2", "host_disk_low", "host", d["label"],
+                                         f"{d['label']} 可用 {pct}%（< {DISK_WARN_PCT}%，非系统盘 ⇒ 知情项）",
+                                         f"free {d['free_gb']} GB / total {d['total_gb']} GB")])
     for d in dirs:
         if d["is_log"] and d["mb"] > LOG_VOLUME_WARN_MB:
             add_findings(r, [finding("P1", "log_volume", "host", d["label"],
                                      f"{d['label']} 体积 {d['mb']} MB（> {LOG_VOLUME_WARN_MB} MB）",
                                      f"{d['path']}（{d['files']} 文件）")])
+
+    # —— 工作区级预算（2026-10-11 追加）：回答「是不是**我们自己**在膨胀」——
+    #    ⚠️ 「扫不到」不得与「没超标」同形 ⇒ 扫描失败时走 `unverified`（日报折入成 P2），
+    #       而不是静默不判。与上面磁盘取不到数的处理同口径。
+    try:
+        ws = ws_scan()
+        ws["budget_rows"] = ws_budget_rows(ws)
+        r["sections"]["workspace"] = ws
+        add_findings(r, ws_budget_findings(ws))
+    except Exception as exc:  # noqa: BLE001 —— 扫描失败不得让整支巡检崩掉
+        r["sections"]["workspace"] = {"error": repr(exc)}
+        r["unverified"].append({"item": "workspace_budget", "value": None,
+                                "reason": f"工作区体量扫描失败：{exc!r}"})
 
     # —— 采集但**不判**：设计案 §7.4 只承认磁盘与日志目录三个初值 ——
     try:
