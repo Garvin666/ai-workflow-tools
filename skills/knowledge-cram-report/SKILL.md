@@ -4,7 +4,7 @@ description: 把「一次任务真正学到的东西」抽出来、用自己的�
 agent_created: true
 selfbuilt: true
 repo: https://github.com/Garvin666/ai-workflow-tools/blob/main/skills/knowledge-cram-report/SKILL.md
-version: 1.0.2
+version: 1.0.3
 ---
 
 # 知识点恶补 PDF 报告机制
@@ -45,7 +45,7 @@ version: 1.0.2
 ## 归档结构（按项目名分层）
 
 ```
-<归档根>\                              # 例如 E:\ChatGPT\工作流\恶补
+<归档根>\                              # 归档根＝任务所在工作空间的 恶补\（2026-10-12 起；下方结构以知识库工作区根 E:\ChatGPT\知识库\恶补 为完整示例，见文末「归档根」小节）
 ├── 00-索引.md                         # 唯一去重事实源 + 复习调度台账（脚本维护，勿手改）
 ├── _assets\
 │   ├── 恶补模板.md                     # 报告骨架模板
@@ -164,12 +164,14 @@ version: 1.0.2
 
 ```bash
 S=~/.workbuddy/skills/knowledge-cram-report/scripts          # 下文以 $S 代指
+# 根/索引路径按「任务所在工作空间」给：以下示例取知识库工作区任务（根＝E:/ChatGPT/知识库/恶补）；
+# 其它工作区一律把根/索引换成任务所在工作空间的 恶补/ 下（2026-10-12 起口径）
 
 # 0) 环境自检（缺依赖就明确报错，退出码 3，**不静默降级**）
 python $S/cram_env.py
 
 # 1) 派生归档落点（唯一口径源）
-python $S/cram_index.py place --root "E:/ChatGPT/工作流/恶补" \
+python $S/cram_index.py place --root "E:/ChatGPT/知识库/恶补" \
     --project 工作流 --date 2026-10-07 --task 实施-知识点恶补报告机制
 
 # 2) 写报告（md 需先按模板写好在落点目录里）
@@ -177,23 +179,23 @@ python $S/cram_index.py place --root "E:/ChatGPT/工作流/恶补" \
 #    重渲染一份**已进台账**的报告（无新增行）时传 --expect-added 0，否则 V5 会误红。
 python $S/cram_render.py --src "<落点>/YYYY-MM-DD_<任务>_恶补报告.md" \
     --out "<落点>/YYYY-MM-DD_<任务>_恶补报告.pdf" \
-    --index "E:/ChatGPT/工作流/恶补/00-索引.md" --index-before <本轮写前的行数> \
+    --index "E:/ChatGPT/知识库/恶补/00-索引.md" --index-before <本轮写前的行数> \
     --expect-added 1 \
-    --dest-root "E:/ChatGPT/工作流/恶补" --project 工作流 \
-    --template "E:/ChatGPT/工作流/恶补/_assets/恶补模板.tex" \
+    --dest-root "E:/ChatGPT/知识库/恶补" --project 工作流 \
+    --template "E:/ChatGPT/知识库/恶补/_assets/恶补模板.tex" \
     --evidence "<任务目录>/证据"
 
 # 3) 写索引（三态判定；同一 report_id 重跑幂等，不重复计数）
-python $S/cram_index.py upsert --index "E:/ChatGPT/工作流/恶补/00-索引.md" \
+python $S/cram_index.py upsert --index "E:/ChatGPT/知识库/恶补/00-索引.md" \
     --project 工作流 --date 2026-10-07 --task 实施-知识点恶补报告机制 \
     --items "<任务目录>/tmp/items.json"
 
 # 4) 今天该复习什么
-python $S/cram_index.py due --index "E:/ChatGPT/工作流/恶补/00-索引.md"
+python $S/cram_index.py due --index "E:/ChatGPT/知识库/恶补/00-索引.md"
 
 # 5) 台账自洽校验（V11 血缘）：S 须由出现次数递推、下次复习须由 S 派生
 #    报红即「行间串扰」——某几行继承了不该属于它的递进 S（迁移/手写台账最容易犯）
-python $S/cram_index.py verify --index "E:/ChatGPT/工作流/恶补/00-索引.md"
+python $S/cram_index.py verify --index "E:/ChatGPT/知识库/恶补/00-索引.md"
 
 # 6) 判据自测（阴性 + 阳性对照；改判据后必跑）
 python $S/cram_render.py --selftest
@@ -238,4 +240,4 @@ python $S/cram_index.py selftest
 | 环境依赖 | pandoc + MiKTeX **不在版本控制里**，换机器会断；故每次生成前先跑 `cram_env.py`，缺了就明确报错 |
 | 「通俗」 | 无机器判据。可用 ai-workflow 的 `humanize_scan.py` 做机器档筛查，但语义档只能人审，且它不是 AI 检测器 |
 | 公式可选中复制 | 不同 PDF 阅读器对 LaTeX 生成的字形支持不一，**不保证**整段公式可选中复制 |
-| 归档根 | `E:/ChatGPT/工作流/恶补/`（在工作区内 ⇒ **不再是越界写入**）。2026-10-07 由 `Desktop\恶补` 迁入，消除「逐次越界授权」 |
+| 归档根 | **任务所在工作空间的 `恶补\<项目名>\<年-月>\`（2026-10-12 用户指令起；知识库工作区任务＝`E:/ChatGPT/知识库/恶补/`）**。沿革：`Desktop\恶补`（越界写）→ `E:/ChatGPT/知识库/恶补/`（2026-10-07 迁入工作区、消除逐次授权）→ `E:/ChatGPT/知识库/恶补/`（2026-10-08 随知识库建立整体迁入，46 文件逐字节对账一致）→ **本地化（2026-10-12：内容产物一律留在任务所在工作空间内）**：报告落任务所在工作空间的 `恶补\`；`E:/ChatGPT/知识库/恶补/` 收窄为「知识库工作区自身的恶补根 ＋ 此前历史存量库」，非知识库工作区的新报告不再跨区写入。命令一律显式传 `--root`／`--dest-root`／`--index` 指向目标归档根 |
