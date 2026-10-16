@@ -6,7 +6,8 @@
 #       另含三件「知识生命周期」能力：**冲突登记冻结**（P0-1）／**废止提案**（P0-2）／**证据固化**（P0-3）。
 # 适用场景：ai-workflow 阶段 6 收尾的「学习循环」（K2 累积 / K3 蒸馏 / K4 校验 / K5 入库）的唯一机器实现。
 # 作者：ai-workflow 自研（技能增强-ai-workflow-v4.8.0-2026-09-25，2026-09-25；
-#       P0 修复：学习模型开源对标与优化-2026-09-25，2026-09-25）
+#       P0 修复：学习模型开源对标与优化-2026-09-25，2026-09-25；
+#       账本一致性 ＋ 库内去重判据修正：机制-记忆管理与交接自升级-2026-10-16，2026-10-16）
 # 仓库：https://github.com/Garvin666/ai-workflow-tools
 """kb_learn.py —— 学习模型（learning-model）的**确定性算术半边**
 
@@ -35,8 +36,8 @@
     ⚠️ 快照**同样过敏感扫描**，命中即**整条驳回、不落池也不落档**。
 
 【诚实边界（与手册 §7 同一条纪律）】
-  · 阈值 `MIN_EVIDENCE` / `AUTO_COMMIT` / `DUP_THRESHOLD` 与锚点 `ANCHORS` / 温度 `TAU` 都是
-    **未拟合先验** ⇒ 不得据此声称「学习准确率 X%」，也不得作为阈值依据。
+  · 阈值 `MIN_EVIDENCE` / `AUTO_COMMIT` / `KB_DUP_MATCH_RATIO` / `KB_DUP_DENSE_SIM` 与锚点
+    `ANCHORS` / 温度 `TAU` 都是**未拟合先验** ⇒ 不得据此声称「学习准确率 X%」，也不得作为阈值依据。
   · 门槛只保证「同一条重复出现足够多次」，**不保证它是对的** —— 反复出现的偏见会被学成"偏好"，
     这是本模块的结构性风险，只能靠两段式（高置信自动、其余人工）与定期复查缓解。
   · **池内去重仍是字面级**（`sha1(normalize(text))`）：同义改写各成一条，会**稀释证据计数**
@@ -92,7 +93,18 @@ KB_ANCHORS = {                   # 各类型在 V1–V5 上的理想位置（未
     "无":       (0.10, 0.05, 0.02, 0.05, 0.08),
 }
 KB_AUTO_COMMIT = 0.85            # 自动入库的置信门槛
-KB_DUP_THRESHOLD = 0.86          # 库内去重相似度门槛
+# 库内去重（`--kb-check`）**绝对量**双条件 —— 2026-10-16 修。
+# ⚠️ 旧实现是 `KB_DUP_THRESHOLD = 0.86`，比的是 `kb.py retrieve` 的 `score`；而 hybrid 模式下
+#    `score` 经**逐查询 min-max 归一**（`kb.py` L588–597）⇒ 顶分**恒 ≈1.0** ⇒ 与任何绝对门槛
+#    比较**恒真** ⇒ 只要检索可用，闸门恒判「库中已有」⇒ **K5 永不吸收**（实测：乱码查询顶分
+#    0.982、其 `dense_sim` 仅 0.707；「行尾契约」被判与「升级清单」相似度 0.939）。
+#    这是「判据造信号」型失效 —— 与「τ 过大 ⇒ band 恒 hold」同型：不报错、只是永远不做。
+# 两阈值为**未拟合先验**（2026-10-16 以四组检索对照定标：真重复 (0.78, 0.88)／无关
+# (0.34–0.58, 0.72–0.88)／乱码 (0.42, 0.71)／库中无此文 (0.52, 0.78)；另以 8 条待入库候选的
+# top-1 抽查）—— 不得据此声称准确率；**改后必跑 `selftest`**。
+# 取两种失效中较无害的一种：**宁放行不误阻断**（误放行 = KB 多一条近似文档；误阻断 = 管线静默不吸收）。
+KB_DUP_MATCH_RATIO = 0.70        # 词面覆盖率门槛（候选词已在目标文档出现的比例）
+KB_DUP_DENSE_SIM = 0.72          # 稠密余弦门槛（与 KB `config.json` 的 dense_similarity_threshold 同源）
 KB_DEFAULT_MIN_EVIDENCE = 1      # 通用最低证据次数
 KB_MIN_EVIDENCE = {"偏好": 2}    # 类型级覆盖：偏好门槛更高（单次极可能是一次性情境）
 KB_AUTO_BAND = 0.95              # 自采信带（与契约 §5 同源）
@@ -358,7 +370,8 @@ def save_pool(pool_dir: Path, rows: list) -> None:
         "total": len(rows),
         "thresholds": {"min_evidence": KB_MIN_EVIDENCE,
                        "default_min_evidence": KB_DEFAULT_MIN_EVIDENCE,
-                       "auto_commit": KB_AUTO_COMMIT, "dup_threshold": KB_DUP_THRESHOLD,
+                       "auto_commit": KB_AUTO_COMMIT,
+                       "dup_match_ratio": KB_DUP_MATCH_RATIO, "dup_dense_sim": KB_DUP_DENSE_SIM,
                        "evidence_max": KB_EVIDENCE_MAX, "fitted": False},
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -623,7 +636,23 @@ def render_content(cand: dict) -> str:
 
 
 def kb_search_duplicate(kb_root: Path, text: str) -> tuple:
-    """库内去重（可选）：调 KB-First 同一引擎检索，取最高分。返回 (是否重复, 分数, 命中 id)。"""
+    """库内去重（可选）：**绝对量**判据（2026-10-16 重写）。返回 `(是否重复|None, 词面覆盖率, 命中 id)`。
+
+    ⚠️ **不得把 `score` 当相似度**：`kb.py retrieve` 在 hybrid 模式下对**每次查询**做 min-max
+    归一（`kb.py` L588–597）⇒ 顶分**恒 ≈1.0**。旧实现拿它与绝对门槛 0.86 比较 ⇒ 判据恒真 ⇒
+    只要检索可用，闸门就恒判「库中已有」⇒ **K5 永不吸收任何条目**（实测 2026-10-16：乱码查询
+    顶分 0.982、其 `dense_sim` 仅 0.707；8 条全新候选被 12 条「库中已有」全数拦下，引用到的
+    id 全是无关文档）。这是「**判据造信号**」型失效 —— **全红与全绿一样，先怀疑判据**。
+
+    判据改为两条**绝对**量联合（都过才算重复）：`match_ratio`（词面覆盖率 —— 候选词大面积
+    已出现在某文档里，是「同一条知识」的强证据）＋ `dense_sim`（原始余弦，门槛与 KB
+    `config.json` 的 `dense_similarity_threshold` 同源，不另造口径）。
+
+    ⚠️ **三态**：`True`＝重复／`False`＝无重复／**`None`＝未检测**。检索失败、或结果缺
+    `dense_sim`（后端回落到 tfidf）⇒ 双条件**无法完整求值** ⇒ 报「未检测」，调用方须与
+    「无重复」**分开处置**。旧实现把失败静默当成「无重复」，于是闸门随环境翻转
+    （同日 19:07 全放行、19:26 全阻断）—— **「沉默」不得与「通过」混淆**。
+    """
     rc, out = kb_run(kb_root, ["retrieve", "--query", text[:200], "--top-k", "3", "--json"])
     if rc != 0 or not out:
         return None, None, None
@@ -632,12 +661,17 @@ def kb_search_duplicate(kb_root: Path, text: str) -> tuple:
     except (ValueError, IndexError):
         return None, None, None
     items = data.get("results") or data.get("items") or []
-    best, bid = 0.0, None
+    best, bid = -1.0, None
     for it in items:
-        sc = float(it.get("score") or 0.0)
-        if sc > best:
-            best, bid = sc, it.get("id")
-    return (best >= KB_DUP_THRESHOLD), best, bid
+        ds = it.get("dense_sim")
+        if ds is None:
+            return None, None, None        # 稠密余弦缺失 ⇒ 判据求不全 ⇒ 未检测（不猜）
+        mr = float(it.get("match_ratio") or 0.0)
+        if mr >= KB_DUP_MATCH_RATIO and float(ds) >= KB_DUP_DENSE_SIM and mr > best:
+            best, bid = mr, it.get("id")
+    if best < 0:
+        return False, 0.0, None
+    return True, best, bid
 
 
 # ─────────────────────────── 子命令 ───────────────────────────
@@ -783,6 +817,8 @@ def evaluate(cand: dict, dup_checked: bool, kb_root: Path) -> tuple:
     就是走进这个分支本身 —— 循环依赖 = 死代码）。现在 `cmd_note --contradicts` 会把它置真。
     """
     reasons = []
+    notes = []          # ⚠️ **说明**（不阻断判定）—— 与 `reasons`（门槛缺口）分开：
+    #                     库内去重「未检测」属说明，不得因它把条目判成「观察」（那又变成「沉默即阻断」）
     main = str(cand.get("kind", "")).split("+")[0].strip()
     need = min_evidence_of(cand.get("kind", ""))
     if int(cand.get("evid_count", 1)) < need:
@@ -811,12 +847,16 @@ def evaluate(cand: dict, dup_checked: bool, kb_root: Path) -> tuple:
                            "`kb_learn.py retire --approve <id> --apply`"
                            % ("、".join("learn-" + str(k) for k in sb) if sb else "未知条目")] + reasons)
     if dup_checked:
-        dup, score, bid = kb_search_duplicate(kb_root, str(cand.get("text", "")))
-        if dup:
-            reasons.append("库中已有（相似度 %.3f，id=%s）" % (float(score or 0), bid))
+        dup, mr, bid = kb_search_duplicate(kb_root, str(cand.get("text", "")))
+        if dup is None:
+            notes.append("库内去重**未检测**（检索不可用或稠密余弦缺失）—— 本次未按重复处理")
+        elif dup:
+            reasons.append("库中已有（词面覆盖率 %.3f ≥ %.2f 且稠密余弦 ≥ %.2f，id=%s）"
+                           % (float(mr or 0), KB_DUP_MATCH_RATIO, KB_DUP_DENSE_SIM, bid))
     if reasons:
-        return "观察", reasons
-    return "入库", ["门槛全过（type=%s，证据 %d 次）" % (main, int(cand.get("evid_count", 1)))]
+        return "观察", reasons + notes
+    return "入库", (["门槛全过（type=%s，证据 %d 次）" % (main, int(cand.get("evid_count", 1)))]
+                   + notes)
 
 
 def cmd_commit(args) -> int:
@@ -900,14 +940,27 @@ def cmd_commit(args) -> int:
                 r["kb_id"] = kb_id
             item["state_after"] = r["state"]
             res["入库"].append(item)
+            # ⚠️ 账本侧同一纪律（2026-10-16 修）：`decisions.jsonl` 留的是**行为**，dry-run 不是行为
+            #    ⇒ 记 `applied=false` 且**不带 `kb_id`**（id 只可随真写入发出）。此前无论是否 `--apply`
+            #    都写 `action=入库 + learn-*`，且无任何字段可分辨 ⇒ 实测 dry-run 留下的 8 个 id
+            #    逐个 `kb.py get` 皆 rc=1（库里查无此文）＝**账本声称的事从未发生**。
+            #    与池侧那条是同一条「没做的事不得记成做了」——当时只修了池侧，账本漏了。
             log_decision(pool_dir, {"key": r.get("key"), "action": "入库",
-                                    "reason": "；".join(reasons), "kb_id": kb_id})
+                                    "reason": "；".join(reasons),
+                                    "kb_id": kb_id if args.apply else None,
+                                    "applied": bool(args.apply)})
         else:
-            r["state"] = verdict
+            # ⚠️ dry-run **不得改池状态**（2026-10-16 修；与手册「不加 `--apply` 时池条目原地不动」对齐）：
+            #    此前该处无条件执行 `state = verdict`，于是 dry-run 也能把 `已入库` 降级成 `观察`、
+            #    或把条目置 `驳回` —— 判定是判定，落盘是落盘，两者不得混为一谈。
+            #    （`supersedes` 的**提案登记与冻结**不在此列：那是 commit 的池侧动作，提案 ≠ 执行。）
+            if args.apply:
+                r["state"] = verdict
             item["state_after"] = r["state"]
             res[verdict].append(item)
             log_decision(pool_dir, {"key": r.get("key"), "action": verdict,
-                                    "reason": "；".join(reasons), "kb_id": None})
+                                    "reason": "；".join(reasons), "kb_id": None,
+                                    "applied": bool(args.apply)})
 
     if proposals:
         log_decision(pool_dir, {"key": None, "action": "废止提案",
@@ -980,7 +1033,8 @@ def cmd_stats(args) -> int:
         "总数": len(rows), "按类型": by_kind, "按状态": by_state,
         "跳过坏行": bad,
         "门槛": {"min_evidence": KB_MIN_EVIDENCE, "default_min_evidence": KB_DEFAULT_MIN_EVIDENCE,
-                "auto_commit": KB_AUTO_COMMIT, "dup_threshold": KB_DUP_THRESHOLD,
+                "auto_commit": KB_AUTO_COMMIT,
+                "dup_match_ratio": KB_DUP_MATCH_RATIO, "dup_dense_sim": KB_DUP_DENSE_SIM,
                 "evidence_max": KB_EVIDENCE_MAX, "fitted": False},
         "废止提案": {"总数": len(props),
                      "待放行": len([p for p in props if p.get("status") == "待放行"])},
@@ -1350,6 +1404,124 @@ def cmd_selftest(args) -> int:
             "P0-3 阴性对照 ⭐：驳回时**不得落档**（归档 %d→%d 条）" % (_ab, arch_lines(pool)))
         chk(not any("这条不该被记住" == r.get("text") for r in rows),
             "P0-3 阴性对照：被驳回的条目不得以任何形式留在池内")
+
+    # ⑪ ⭐ 账本一致性（2026-10-16 修）：dry-run **不得**在 `decisions.jsonl` 里冒充「入库」、
+    #    也**不得**改池状态；加了 `--apply` 才两处都落。
+    #    此前：dry-run 照样记 `action=入库 + learn-* id`（无 `applied` 字段 ⇒ 与真入库无法分辨），
+    #    且非入库判定也照样写池（能把 `已入库` 降级为 `观察`）。实测：dry-run 留下的 8 个 id
+    #    逐个 `kb.py get` 皆 rc=1 ⇒ 账本声称的事从未发生（与池侧那条同族，当时只修了池侧）。
+    #    ⚠️ 本组必须**两条样本各走一支**（入库 / 观察），且 apply 侧要断言"真的落了状态"——
+    #       否则守门断言可能因"那一支根本没被走进"而**恒真**（空转）。
+    with tempfile.TemporaryDirectory(prefix="kblearn_a_") as td:
+        pool, fk = Path(td), Path(td) / "kb"
+        fk.mkdir()
+        (fk / "kb.py").write_text("# stub：仅用于让 kb_script().exists() 为真\n", encoding="utf-8")
+        k_ok, k_dem = cand_key("账本样本A"), cand_key("账本样本B")
+        save_pool(pool, [
+            {"key": k_ok, "kind": "领域知识", "text": "账本样本A", "confidence": 0.95,
+             "evid_count": 2, "boundary": "b", "sources": [], "state": "观察",
+             "evidence": [], "conflict_with": []},
+            {"key": k_dem, "kind": "领域知识", "text": "账本样本B", "confidence": 0.50,
+             "evid_count": 2, "boundary": "b", "sources": [], "state": "已入库",
+             "kb_id": "learn-" + k_dem, "evidence": [], "conflict_with": []},
+        ])
+
+        def dec_recs():
+            p = _pool_paths(pool)["decisions"]
+            if not p.exists():
+                return []
+            return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+        _o_run2, _o_ex2 = globals()["kb_run"], globals()["kb_exists"]
+        try:
+            globals()["kb_run"] = lambda root, a, timeout=120: (0, "ok")
+            globals()["kb_exists"] = lambda root, i: False
+            # 前置：两条必须各走一支（否则下面的守门断言各差一半是空转）
+            chk(evaluate({"kind": "领域知识", "text": "x", "confidence": 0.95, "evid_count": 2,
+                          "boundary": "b", "state": "观察"}, False, Path("."))[0] == "入库",
+                "账本前置：样本A 须判『入库』（否则入库侧断言空转）")
+            chk(evaluate({"kind": "领域知识", "text": "x", "confidence": 0.50, "evid_count": 2,
+                          "boundary": "b", "state": "已入库"}, False, Path("."))[0] == "观察",
+                "账本前置：样本B 须判『观察』（否则非入库侧断言空转）")
+
+            silent_main(["commit", "--pool", str(pool), "--kb-root", str(fk)])
+            d1 = [x for x in dec_recs() if x.get("action") == "入库"]
+            chk(bool(d1), "账本前置：dry-run 也须留痕（否则无从分辨跑没跑过）")
+            chk(all(x.get("applied") is False for x in d1),
+                "dry-run ⭐：决策记录必须标 `applied=false`（实得 %s）" % [x.get("applied") for x in d1])
+            chk(all(not x.get("kb_id") for x in d1),
+                "dry-run ⭐：决策记录**不得**带 kb_id（KB 里没有该文档；实得 %s）"
+                % [x.get("kb_id") for x in d1])
+            _b1 = next(x for x in load_pool(pool)[0] if x["key"] == k_dem)
+            chk(_b1.get("state") == "已入库",
+                "dry-run ⭐：非入库判定**不得**改池状态（否则 dry-run 能把『已入库』降级为『观察』；"
+                "实得 %s）" % _b1.get("state"))
+
+            silent_main(["commit", "--pool", str(pool), "--kb-root", str(fk), "--apply"])
+            d2 = [x for x in dec_recs() if x.get("action") == "入库"]
+            new = d2[len(d1):]
+            chk(bool(new) and all(x.get("applied") is True and x.get("kb_id") for x in new),
+                "正向对照 ⭐：`--apply` 的决策记录必须 `applied=true` **且**带 kb_id（实得 %s）"
+                % [(x.get("applied"), x.get("kb_id")) for x in new])
+            _b2 = next(x for x in load_pool(pool)[0] if x["key"] == k_dem)
+            chk(_b2.get("state") == "观察",
+                "正向对照：`--apply` 时该分支必须**真的**落状态（否则上面那条守门断言是恒真；"
+                "实得 %s）" % _b2.get("state"))
+        finally:
+            globals()["kb_run"], globals()["kb_exists"] = _o_run2, _o_ex2
+
+    # ⑫ ⭐ 库内去重判据（2026-10-16 重写）：**必须用绝对量**，且三态（重复／无重复／**未检测**）不得混淆。
+    #    旧实现拿 `kb.py` 的 `score` 比绝对门槛 0.86；而 `score` 在 hybrid 模式下经**逐查询
+    #    min-max 归一** ⇒ 顶分恒 ≈1 ⇒ **判据恒真** ⇒ 只要检索可用，闸门恒判「库中已有」⇒ K5 永不吸收。
+    #    本组用**同一份载荷**对照：归一化顶分 0.98 + 低绝对量 ⇒ 不得判重（旧判据在此必判重）。
+    with tempfile.TemporaryDirectory(prefix="kblearn_d_") as td:
+        pool = Path(td)
+        _o_run3 = globals()["kb_run"]
+
+        def _fake_ret(payload, rc=0):
+            globals()["kb_run"] = (lambda root, a, timeout=120:
+                                   (rc, json.dumps(payload, ensure_ascii=False)))
+        try:
+            # (a) 归一化顶分 0.982（旧判据会判重），但两条**绝对**量都低 ⇒ 无重复
+            _fake_ret({"results": [{"id": "无关文档", "score": 0.982,
+                                    "match_ratio": 0.30, "dense_sim": 0.70}]})
+            _d = kb_search_duplicate(pool, "随便一句话")
+            chk(_d[0] is False,
+                "去重判据 ⭐：高 `score`（0.982）＋低绝对量**不得**判重复（实得 %r）" % (_d[0],))
+            # (b) 真重复：两条绝对量都过 ⇒ 判重，且须回报判重的那个 id
+            _fake_ret({"results": [{"id": "真重复", "score": 0.93,
+                                    "match_ratio": 0.78, "dense_sim": 0.88}]})
+            _d2 = kb_search_duplicate(pool, "随便一句话")
+            chk(_d2[0] is True and _d2[2] == "真重复",
+                "去重判据：两条绝对量都过 ⇒ 必须判重并回报命中 id（实得 %r/%r）" % (_d2[0], _d2[2]))
+            # (b′) 单腿不算：词面过、余弦不过 ⇒ 不得判重（证明条件确实是「与」不是「或」）
+            _fake_ret({"results": [{"id": "单腿", "score": 0.93,
+                                    "match_ratio": 0.90, "dense_sim": 0.10}]})
+            chk(kb_search_duplicate(pool, "x")[0] is False,
+                "去重判据：只有词面覆盖过、余弦不过 ⇒ 不得判重（否则是「或」）")
+            # (c) 检索失败 ⇒ **未检测**（不得当成「无重复」——旧实现正是这样让闸门随环境翻转）
+            _fake_ret({"results": []}, rc=1)
+            chk(kb_search_duplicate(pool, "x")[0] is None,
+                "去重判据 ⭐：检索失败必须报「未检测」（实得 %r）" % (kb_search_duplicate(pool, "x")[0],))
+            # (d) 缺 dense_sim（稠密后端回落 tfidf）⇒ 判据求不全 ⇒ 未检测（不猜）
+            _fake_ret({"results": [{"id": "x", "score": 0.9, "match_ratio": 0.9}]})
+            chk(kb_search_duplicate(pool, "x")[0] is None, "去重判据：缺 dense_sim ⇒ 必须报「未检测」")
+            # (e) 「未检测」在 evaluate 层：**可见但不阻断**（说明与门槛缺口分开，SKIP 不并入 PASS 也不当 FAIL）
+            _fake_ret({"results": []}, rc=1)
+            _v, _rs = evaluate({"kind": "领域知识", "text": "x", "confidence": 0.95, "evid_count": 2,
+                                "boundary": "b", "state": "观察"}, True, pool)
+            chk(_v == "入库", "未检测 ⭐：不得因「未检测」把条目判成「观察」（实得 %s）" % _v)
+            chk("未检测" in "；".join(_rs),
+                "未检测 ⭐：必须把「未检测」**写进结论**（沉默不得与通过混淆；实得 %s）" % _rs)
+            # (f) 真重复在 evaluate 层：仍须拦下（证明判据没被改松到失效）
+            _fake_ret({"results": [{"id": "真重复", "score": 0.9,
+                                    "match_ratio": 0.80, "dense_sim": 0.90}]})
+            _v2, _rs2 = evaluate({"kind": "领域知识", "text": "x", "confidence": 0.95, "evid_count": 2,
+                                  "boundary": "b", "state": "观察"}, True, pool)
+            chk(_v2 == "观察" and "库中已有" in "；".join(_rs2),
+                "去重 ⭐：真重复仍须拦下并写明理由（实得 %s / %s）" % (_v2, _rs2))
+        finally:
+            globals()["kb_run"] = _o_run3
 
     total = n[0]
     for f in fails:
