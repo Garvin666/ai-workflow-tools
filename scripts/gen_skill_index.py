@@ -180,8 +180,11 @@ def load_usage(root: Path) -> dict:
     正文再参与指纹，则**每次台账刷新都会让索引判 STALE**，把「内容变没变」这个诚实的判据
     污染成「台账新不新」。所以：**台账状态只影响渲染，不参与 fingerprint**。
 
-    ⭐ 为什么不写进 SKILL.md frontmatter：102 个技能里 26 个是非自建（市场安装），改它们
-    frontmatter 会在下次市场升级时被覆盖 —— 台账会静默丢失。sidecar 文件是市场不管的。
+    ⭐ 为什么不写进 SKILL.md frontmatter：技能库里**多数**技能是非自建（市场安装 / 上游同步），
+    改它们 frontmatter 会在下次市场升级时被覆盖 —— 台账会静默丢失。sidecar 文件是市场不管的。
+    （2026-10-20 修正：此处原写「102 个技能里 26 个是非自建」，实测 `selfbuilt: true` 只有
+    1 个、台账 A类(外部) 46 个 ⇒ 原文的 26 与 102 都是会失效的时点数，且与台账口径不同源。
+    按「同一物理量不写两处」，来源分类一律以台账备注列为准，本处不复制计数。）
 
     文件格式（制表符分隔，`#` 开头为注释）：
         技能目录名\t状态\t调用次数
@@ -441,6 +444,130 @@ def is_fresh_auto(index: Path) -> tuple[bool, str]:
     return True, "内容指纹一致（%s），%d 个技能目录 ｜ 根集来源：%s" % (stored, n, src)
 
 
+# ── --selftest：核心判据回归（临时目录造最小假技能库，不触碰真实技能库）─────────
+
+def _selftest() -> int:
+    """回归四类判据：frontmatter 解析（含块标量）/ 目录跳过与分簇 / 纯内容指纹 / 根集同源。
+
+    造法：`tempfile.TemporaryDirectory()` 下建 2~3 个假技能目录，索引也写在临时目录里
+    （**绝不写** `DEFAULT_INDEX`）。不联网、不读凭据。
+    含阴性对照：非 frontmatter 文本、改一字节、换根校检、空根 —— 都应被判据拒绝。
+    """
+    import contextlib
+    import io
+    import os
+    import tempfile
+
+    n_pass = n_all = 0
+
+    def check(case, actual, expect) -> None:
+        nonlocal n_pass, n_all
+        n_all += 1
+        hit = actual == expect
+        n_pass += 1 if hit else 0
+        print(f"[{'PASS' if hit else 'MISS'}] {case}：实际={actual} 期望={expect}")
+
+    def run_main(argv):
+        """以指定 argv 调用 main()；stdout/stderr 一并吞掉（main 会往 stderr 写 WARN）。"""
+        old, buf = sys.argv, io.StringIO()
+        sys.argv = ["gen_skill_index.py", *argv]
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rc = main()
+        finally:
+            sys.argv = old
+        return rc, buf.getvalue()
+
+    # ① frontmatter 解析（块标量是历史事故点，必须有正例）
+    fm = parse_frontmatter("---\nname: demo\ndescription: 演示技能\n---\n正文\n")
+    check("frontmatter 单行 key: value", (fm.get("name"), fm.get("description")),
+          ("demo", "演示技能"))
+    fm2 = parse_frontmatter("---\nname: demo\ndescription: >\n  折叠的\n  用途说明\n---\n")
+    check("frontmatter 块标量折叠为一行（不是字面量 >）", fm2.get("description"),
+          "折叠的 用途说明")
+    check("阴性 非 frontmatter 文本 → {}", parse_frontmatter("# 普通文档\n"), {})
+
+    # ② 目录跳过 / 分簇
+    check("is_skipped 备份·归档·点目录一律跳过",
+          [is_skipped(n) for n in ("ai-workflow.bak-20260926", "_archive", ".git", "x.backup-1")],
+          [True, True, True, True])
+    check("is_skipped 正常技能名不跳过", is_skipped("ai-workflow"), False)
+    counts = {"ai": 2, "solo": 1}
+    check("cluster_key 前缀出现>=2 才成簇", cluster_key("ai-workflow", counts), "ai-*")
+    check("cluster_key 前缀仅 1 次归独立技能", cluster_key("solo-x", counts), "独立技能")
+    check("est_tok 汉字+ASCII 粗估", est_tok("中文ab"), 2)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = tmp / "skills"
+        root.mkdir()
+        for n in ("ai-one", "ai-two"):
+            d = root / n
+            d.mkdir()
+            (d / "SKILL.md").write_text(
+                f"---\nname: {n}\ndescription: 用途 {n}\n---\n正文\n", encoding="utf-8")
+        # 干扰项：备份目录（有 SKILL.md 但应跳过）与无 SKILL.md 的目录
+        (root / "ai-workflow.bak-1").mkdir()
+        (root / "ai-workflow.bak-1" / "SKILL.md").write_text("x", encoding="utf-8")
+        (root / "no-skill-md").mkdir()
+
+        # ③ 指纹：只由内容决定
+        fp1, n1 = fingerprint([root])
+        check("fingerprint 只计有效技能目录", n1, 2)
+        os.utime(root / "ai-one" / "SKILL.md", (1_000_000_000, 1_000_000_000))
+        check("fingerprint 对 touch 免疫（纯内容指纹）", fingerprint([root])[0], fp1)
+        (root / "ai-two" / "SKILL.md").write_text(
+            "---\nname: ai-two\ndescription: 用途改过一个字节\n---\n正文\n", encoding="utf-8")
+        check("阴性 内容改一字节则指纹变", fingerprint([root])[0] != fp1, True)
+
+        # ④ 生成 → 裸 --check（根集自洽）→ 改内容判过期
+        index = tmp / "README.md"
+        rc, _ = run_main(["--roots", str(root), "--index", str(index)])
+        check("生成索引的 rc", rc, 0)
+        check("索引已写入临时路径（未碰真实索引）", index.is_file(), True)
+        rc, _ = run_main(["--index", str(index), "--check"])
+        check("裸 --check 按索引记录的根集判新鲜", rc, 0)
+        (root / "ai-one" / "SKILL.md").write_text(
+            "---\nname: ai-one\ndescription: 又改了\n---\n正文\n", encoding="utf-8")
+        rc, _ = run_main(["--index", str(index), "--check"])
+        check("阴性 源内容变化 → --check 判过期 rc 1", rc, 1)
+
+        # ⑤ 根集记录：机器标记 > 人类行 > 无
+        p1 = tmp / "a.md"
+        p1.write_text("<!-- roots: C:/x|C:/y -->\n> 扫描根：C:/z ｜ 文件位置：…\n",
+                      encoding="utf-8")
+        check("read_roots 机器标记优先", read_roots_from_index(p1)[0],
+              [Path("C:/x"), Path("C:/y")])
+        p2 = tmp / "b.md"
+        p2.write_text("> 扫描根：C:/z ｜ 文件位置：…\n", encoding="utf-8")
+        check("read_roots 旧索引回退人类行", read_roots_from_index(p2)[0], [Path("C:/z")])
+        check("阴性 索引无根集记录 → None",
+              read_roots_from_index(tmp / "missing.md")[0], None)
+
+        # ⑥ 台账分区：unused 不在主表，收到「未启用区」
+        ledger = tmp / "ledger"
+        ledger.mkdir()
+        (ledger / USAGE_LEDGER_NAME).write_text("ai-b\tunused\t0\n", encoding="utf-8")
+        ents = [
+            {"dir": "ai-a", "name": "ai-a", "desc": "甲", "root": str(ledger), "selfbuilt": False},
+            {"dir": "ai-b", "name": "ai-b", "desc": "乙", "root": str(ledger), "selfbuilt": True},
+        ]
+        text = render(ents, [ledger])
+        check("render 分区：unused 不在主表", "| `ai-b`" in text, False)
+        check("render 分区：unused 收进未启用区",
+              ("## " + "\u26d4 " + UNUSED_SECTION) in text, True)
+
+        # ⑦ 阴性：一个技能都没扫到 → rc 2（而不是写出一份空索引）
+        empty = tmp / "empty"
+        empty.mkdir()
+        rc, _ = run_main(["--roots", str(empty), "--index", str(tmp / "i2.md")])
+        check("阴性 零技能 → rc 2 且不写盘",
+              (rc, (tmp / "i2.md").exists()), (2, False))
+
+    print(f"=== selftest：{n_pass}/{n_all} ===")
+    return 0 if n_pass == n_all else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="技能库索引生成/校检（ai-workflow v3.4.0 / P6）")
     ap.add_argument("--index", default=str(DEFAULT_INDEX), help="索引输出路径")
@@ -450,7 +577,12 @@ def main() -> int:
     ap.add_argument("--check", action="store_true",
                     help="只校检新鲜度（只读），过期/缺失以 1 退出；未显式指定 --roots/--workspace 时"
                          "按**索引自己记录的根集**校检（v4.32.1）")
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检（含阴性对照；只在临时目录造假技能库，不碰真实索引）")
     a = ap.parse_args()
+
+    if a.selftest:
+        return _selftest()
 
     roots = [Path(p.strip()) for p in a.roots.split(",")] if a.roots else list(DEFAULT_ROOTS)
     if a.workspace:
