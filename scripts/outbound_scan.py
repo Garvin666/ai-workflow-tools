@@ -44,6 +44,7 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -163,6 +164,60 @@ def scan_paths(paths: list[str]) -> dict:
     return res
 
 
+def selftest() -> int:
+    """`--selftest`：用合成样本回归**判定逻辑本身**（不扫真实文件、不联网、不写用户数据）。
+
+    覆盖：FAIL/WARN 分级、掩码形态不误报、URL 不误判成盘符、行内豁免、每行一条且 FAIL 优先、
+    后缀与二进制跳过（后两条是「不该报的别报」的阴性对照）。
+    """
+    ok = 0
+    total = 0
+
+    def ck(name: str, got, want) -> None:
+        nonlocal ok, total
+        total += 1
+        good = got == want
+        ok += good
+        print("[%s] %s：实际=%r 期望=%r" % ("PASS" if good else "MISS", name, got, want))
+
+    def levels(text: str) -> list:
+        return [h["级别"] for h in scan_text(text)]
+
+    # A. 分级判据
+    # 夹具里的主目录路径一律**运行时拼接**：源码中不出现 `C:\Users\<具名用户>\` 字面量，
+    # 否则本文件自身就会撞出站扫描第 4 项（本仓既有做法：夹具不写具体用户名）。
+    U = "C:" + "\\" + "Users" + "\\"
+
+    ck("含用户名的主目录路径 ⇒ FAIL", levels(U + "bob\\project\\a.py"), ["FAIL"])
+    ck("具名盘符但非主目录 ⇒ WARN", levels(r"E:\内部目录\a.py"), ["WARN"])
+    ck("同行 WARN 在前、FAIL 在后 ⇒ 只记 1 条且 FAIL 优先",
+       levels(r"见 E:\内部\a 与 " + U + "bob\\b"), ["FAIL"])
+    ck("行内 outbound-scan:allow ⇒ 计入豁免",
+       [h["豁免"] for h in scan_text(U + "bob\\x  # outbound-scan:allow")], [True])
+
+    # B. 阴性对照：已掩码的形态与 URL 都**不得**报命中（误判比漏判更伤门禁）
+    ck("阴性：占位符 <用户名> 不算命中", levels(r"C:\Users\<用户名>\project\a.py"), [])
+    ck("阴性：省略号掩码 … 不算命中", levels(r"C:\Users\…\project\a.py"), [])
+    ck("阴性：https:// 里的 s:/ 不得当盘符", levels("https://api.github.com/repos/a/b"), [])
+
+    # C. 文件遍历/汇总（tempfile 隔离）
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "a.txt").write_text("path=" + U + "bob\\secret.txt", encoding="utf-8")
+        (d / "b.md").write_text(r"dir=E:\资料\2026", encoding="utf-8")
+        (d / "c.png").write_text("x=" + U + "bob\\fake.png", encoding="utf-8")
+        (d / "bin.dat").write_bytes(b"\x00\x01" + (U + "bob\\raw").encode())
+        res = scan_paths([td])
+        ck("目录汇总 ⇒ FAIL=1 / WARN=1 / 豁免=0",
+           [len(res["fail"]), len(res["warn"]), len(res["allowed"])], [1, 1, 0])
+        ck("阴性：.png 后缀不进扫描清单",
+           sorted(f.name for f in iter_files([td])), ["a.txt", "b.md", "bin.dat"])
+        ck("阴性：含 NUL 的二进制不计命中", scan_file(d / "bin.dat"), [])
+
+    print("=== selftest：%d/%d ===" % (ok, total))
+    return 0 if ok == total else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="outbound_scan.py",
                                  description="出站前扫描：本机绝对路径检测（出站清单第 3/4 项）")
@@ -170,7 +225,12 @@ def main() -> int:
     ap.add_argument("--list", dest="listfile", help="从文件读取待扫路径列表（每行一个，# 开头忽略）")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("-q", "--quiet", action="store_true", help="只输出汇总")
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检：用合成样本回归检测判据（不扫真实文件、不联网）")
     a = ap.parse_args()
+
+    if a.selftest:
+        return selftest()
 
     targets = list(a.paths)
     if a.listfile:
