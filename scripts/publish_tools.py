@@ -366,12 +366,134 @@ def cmd_verify(args) -> int:
     return 1 if any(r[0] == "FAIL" for r in results) else 0
 
 
+# --------------------------------------------------------------------------- #
+# 自检（--selftest）：只跑**不产生外发动作**的判据
+# --------------------------------------------------------------------------- #
+def _st_line(name: str, actual, expect) -> bool:
+    hit = actual == expect
+    print("[%s] %s：实际=%s 期望=%s" % ("PASS" if hit else "MISS", name, actual, expect))
+    return hit
+
+
+def selftest() -> int:
+    """回归四条核心判据（全程离线，API 一律由假 `_api` 顶替）：
+
+      ① blob sha 口径：与 `git hash-object` 同值（版本一致判据的地基）
+      ② CRLF→LF 归一化：文本类默认转换、--no-normalize 保持原字节、非文本不转换
+      ③ dest 规划与仓库名格式校验（非法仓库名必须抛错，不能猜）
+      ④ fail-closed：`push --apply` 在仓库 private / 本地文件不存在时必须拒绝，
+         且**一次 PUT 都不发**；默认 dry-run 也必须零 PUT
+
+    ⚠️ 凭据解析被替换成常量，`_api` 被替换成记账闭包 —— 本函数**不访问网络、
+       不读任何凭据**（连 `gh auth token` 都不会调）。
+    """
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    ok_n = total = 0
+
+    def chk(name: str, actual, expect) -> None:
+        nonlocal ok_n, total
+        total += 1
+        if _st_line(name, actual, expect):
+            ok_n += 1
+
+    # ① blob sha（"hello\n" 的 git hash-object 值）
+    chk("blob sha：与 git hash-object 同口径", blob_sha(b"hello\n"),
+        "ce013625030ba8dba906f756967f9e9ca394464a")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        py = tmp / "a.py"
+        py.write_bytes(b"x = 1\r\ny = 2\r\n")
+
+        # ② CRLF 归一化
+        data, conv = read_local(py)
+        chk("归一化：文本类 .py 默认 CRLF→LF", (conv, b"\r\n" in data), (True, False))
+        data2, conv2 = read_local(py, normalize=False)
+        chk("归一化：--no-normalize 保持原字节", (conv2, b"\r\n" in data2), (False, True))
+        binp = tmp / "a.png"
+        binp.write_bytes(b"\x89PNG\r\n\x00")
+        _d3, c3 = read_local(binp)
+        chk("归一化：非文本扩展名不转换", c3, False)
+
+        # ③ dest 规划 / 仓库名校验
+        f = Path("scripts/foo.py")
+        chk("dest 规划：未给 --dest → 取文件名", _dest_for(f, None, False), "foo.py")
+        chk("dest 规划：多文件且 dest 无后缀 → 目录前缀",
+            _dest_for(f, "scripts", True), "scripts/foo.py")
+        chk("dest 规划：dest 带后缀 → 原样使用",
+            _dest_for(f, "vendor/bar.py", True), "vendor/bar.py")
+
+        try:
+            _split_repo("no-slash")
+            got = "未抛错"
+        except ValueError:
+            got = "ValueError"
+        chk("参数校验：非法仓库名 → ValueError（不猜 OWNER/NAME）", got, "ValueError")
+
+        # ④ dry-run / fail-closed
+        src = tmp / "foo.py"
+        src.write_text("print(1)\n", encoding="utf-8")
+
+        def make_api(private: bool, remote_status: int):
+            def fake(method: str, path: str, body=None, token=None):
+                calls.append((method, path))
+                if "/contents/" in path:
+                    if remote_status == 404:
+                        return 404, None, "not found"
+                    return 200, {"sha": "0" * 40}, ""
+                return 200, {"private": private,
+                             "html_url": "https://example.invalid/o/r"}, ""
+            return fake
+
+        calls: list[tuple[str, str]] = []
+        ns = SimpleNamespace(repo="o/r", token=None, file=[str(src)], dest="scripts/foo.py",
+                             branch="main", apply=False, message=None, no_normalize=False)
+        orig_api, orig_tok = globals()["_api"], globals()["_resolve_token"]
+        globals()["_resolve_token"] = lambda cli=None: "t" * 40
+        try:
+            globals()["_api"] = make_api(private=False, remote_status=404)
+            results.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc1 = cmd_push(ns)
+            chk("dry-run（默认无 --apply）退出码", rc1, 0)
+            chk("dry-run 绝不写远端：PUT 次数",
+                sum(1 for m, _p in calls if m == "PUT"), 0)
+
+            calls.clear()
+            globals()["_api"] = make_api(private=True, remote_status=404)
+            results.clear()
+            ns.apply = True
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc2 = cmd_push(ns)
+            chk("阴性对照：--apply + private 仓库 → 拒绝（rc=1）", rc2, 1)
+            chk("fail-closed：拒绝时零 PUT", sum(1 for m, _p in calls if m == "PUT"), 0)
+
+            calls.clear()
+            ns.file = [str(tmp / "nope.py")]
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc3 = cmd_push(ns)
+            chk("参数校验：--apply 时本地文件不存在 → rc=2 且零 API 调用",
+                (rc3, len(calls)), (2, 0))
+        finally:
+            globals()["_api"], globals()["_resolve_token"] = orig_api, orig_tok
+            results.clear()
+
+    print("=== selftest：%d/%d ===" % (ok_n, total))
+    return 0 if ok_n == total else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="ai-workflow 自研工具/技能：公开留痕推送与版本校验（v3.1.0）")
     ap.add_argument("--repo", help=f"目标仓库 OWNER/NAME（默认 {DEFAULT_REPO}，可用 SELFTOOL_REPO 覆盖）")
     ap.add_argument("--token", help="GitHub 凭据（默认按 GITHUB_TOKEN / GH_TOKEN / gh auth token 解析）")
     ap.add_argument("--branch", default=DEFAULT_BRANCH, help=f"目标分支（默认 {DEFAULT_BRANCH}）")
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检并退出（离线：blob sha 口径 / CRLF 归一化 / dest 规划 / "
+                         "dry-run 零写入 / --apply 前置拒绝）；不推送、不联网、不读凭据")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="创建**公开**仓库（本规则不允许 private，故无 --private 选项）；幂等：已存在且 public 则跳过")
@@ -392,6 +514,10 @@ def main() -> int:
     p.add_argument("--dest", help="仓内路径（规则同 push）")
     p.add_argument("--no-normalize", action="store_true", help="同 push")
 
+    # 必须在 parse_args() 之前拦截：子命令是 required=True，先 parse 会直接退出 2。
+    # 只扫 argv，不改任何既有参数/默认值/退出码语义。
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
     args = ap.parse_args()
     if args.cmd == "init":
         code = cmd_init(args)
