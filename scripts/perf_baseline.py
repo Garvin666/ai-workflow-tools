@@ -307,11 +307,90 @@ def compare(old: dict, new: dict) -> None:
     print("  ⚠️ 上表只含本机可测的确定性部分（脚本/子进程/IO）；LLM 推理耗时不在本机产生，未计。")
 
 
+def selftest() -> int:
+    """`--selftest`：回归**判据本身**（不跑基线、不联网、不 spawn 子进程、不写用户数据）。
+
+    覆盖：plan 步骤 id 抽取、best() 的取最小语义与调用次数、compare() 的**环境一致性前置判据**
+    （比值 ≥1.5 必须判"不可直接比"）、缺项降级不抛异常、样本 plan 推导。
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    ok = 0
+    total = 0
+
+    def ck(name: str, got, want) -> None:
+        nonlocal ok, total
+        total += 1
+        good = got == want
+        ok += good
+        print("[%s] %s：实际=%r 期望=%r" % ("PASS" if good else "MISS", name, got, want))
+
+    # A. 步骤 id 抽取（mark 测点的输入，抽错就等于测了别的东西）
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "plan.yaml"
+        p.write_text("version: 1\nsteps:\n  - id: T1\n    status: 完成\n- id: T2\n", encoding="utf-8")
+        ck("_plan_ids：缩进/顶格两种写法都认", _plan_ids(p), ["T1", "T2"])
+        p2 = Path(td) / "colon.yaml"
+        p2.write_text("- id: a:b\n", encoding="utf-8")
+        ck("_plan_ids：值内含冒号不被截断", _plan_ids(p2), ["a:b"])
+        p3 = Path(td) / "none.yaml"
+        p3.write_text("steps: []\n# - id: 注释\n", encoding="utf-8")
+        ck("阴性：无 - id: 行 ⇒ 空列表（不得凭空造步骤）", _plan_ids(p3), [])
+
+    # B. best()：取最小 + 恰好跑 runs 次
+    calls = {"n": 0}
+
+    def _tick() -> None:
+        calls["n"] += 1
+        time.sleep(0.001)
+
+    t = best(_tick, runs=5)
+    ck("best(runs=5)：实际调用次数", calls["n"], 5)
+    ck("best：返回 1 位小数毫秒（round 过）", t == round(t, 1), True)
+
+    # C. compare() 的环境一致性前置判据（判错了整张对比表都是假的）
+    old = {"label": "before", "python_start_ms": 100.0, "checks_skill_ms": 100.0}
+    near = {"label": "after", "python_start_ms": 110.0, "checks_skill_ms": 120.0}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        compare(old, near)
+    out = buf.getvalue()
+    ck("compare：启动耗时 1.1 倍 ⇒ 判同模式", "✅ 同模式" in out, True)
+    ck("compare：100→120 ms 的变化率", "+20.0%" in out, True)
+    ck("compare：缺项降级为 — 且不抛异常", "—" in out, True)
+
+    far = {"label": "after", "python_start_ms": 300.0, "checks_skill_ms": 120.0}
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        compare(old, far)
+    out2 = buf2.getvalue()
+    ck("阴性：启动耗时差 3 倍 ⇒ 判环境不同（不可直接比绝对值）",
+       "❌ 环境不同（不可直接比绝对值）" in out2, True)
+    ck("阴性：判环境不同时不得同时宣称同模式", "✅ 同模式" in out2, False)
+
+    # D. 样本 plan 推导：存在真实 plan，或显式落到占位路径（让降级分支可判）
+    sp = _find_sample_plan()
+    ck("_find_sample_plan：返回 plan.yaml 且（存在 或 显式为占位）",
+       (sp.name, sp.exists() or "_占位不存在" in str(sp)), ("plan.yaml", True))
+
+    print("未覆盖：真实基线计时（checks.py 子进程 / py_compile / gh auth token / "
+          "--github-repo 缓存命中 / 网络冷取）")
+    print("=== selftest：%d/%d ===" % (ok, total))
+    return 0 if ok == total else 1
+
+
 def main() -> None:
+    # `--selftest` 在 argparse 之前短路：`--label` 是 required，交给 argparse 会先因缺 --label 报错，
+    # 从而改变既有「缺 --label ⇒ rc=2 + argparse 原始报错」的语义。故只认「作为参数出现」时不进解析。
+    if "--selftest" in sys.argv[1:]:
+        raise SystemExit(selftest())
     ap = argparse.ArgumentParser(description="ai-workflow 本地可测耗时基线")
     ap.add_argument("--label", required=True, help="本次标签，如 before / after")
     ap.add_argument("--out", default=".", help="JSON 落盘目录")
     ap.add_argument("--compare", help="与之对比的既有 JSON 路径")
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检：只回归判据（id 抽取/取最小/环境一致性判定），不跑基线、不联网")
     args = ap.parse_args()
 
     try:
