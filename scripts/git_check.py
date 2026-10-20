@@ -282,6 +282,141 @@ def cmd_preflight(args) -> int:
     return 0 if not any(r[0] == "FAIL" for r in results) else 1
 
 
+# ── --selftest：核心判据回归（只在临时目录造最小假仓，不触碰真实仓库）────────────
+
+def _selftest() -> int:
+    """回归本脚本的四类判据（commit 注释 / .gitignore 覆盖 / 分支状态 / 预检）。
+
+    造法：`tempfile.TemporaryDirectory()` + 假 git 仓（`git init` / `symbolic-ref`，
+    **不做 commit / push**）。不联网、不读凭据、不写用户数据。
+    含阴性对照：故意喂非法提交类型、残缺 .gitignore，证明判据会拒绝；
+    并专测「SKIP（未检测）不算通过」这条口径。git 不在 PATH 时相关用例如实判 MISS。
+    """
+    import contextlib
+    import io
+    import tempfile
+    from types import SimpleNamespace
+
+    n_pass = n_all = 0
+
+    def check(case, actual, expect) -> None:
+        nonlocal n_pass, n_all
+        n_all += 1
+        hit = actual == expect
+        n_pass += 1 if hit else 0
+        print(f"[{'PASS' if hit else 'MISS'}] {case}：实际={actual} 期望={expect}")
+
+    def run(handler, **kw):
+        """跑一个 handler，返回 (rc, results 快照)；屏蔽 handler 内 print。"""
+        results.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = handler(SimpleNamespace(**kw))
+        return rc, list(results)
+
+    def items(rs, st):
+        return [r[1] for r in rs if r[0] == st]
+
+    def count(rs, st):
+        return sum(1 for r in rs if r[0] == st)
+
+    # ① commit 注释（正例 + 三条阴性对照）
+    rc, rs = run(cmd_msg, message="feat: 新增 DAG 工作流调度器")
+    check("msg 合法类型 feat 的 rc", rc, 0)
+    check("msg 合法类型 feat 的 FAIL 数", count(rs, "FAIL"), 0)
+
+    rc, rs = run(cmd_msg, message="chore: 升级依赖")
+    check("阴性 msg 非法类型 chore 的 rc", rc, 1)
+    check("阴性 msg 非法类型 被判据项拒绝", items(rs, "FAIL"), ["提交类型合法"])
+
+    rc, rs = run(cmd_msg, message="新增工作流调度器")
+    check("阴性 msg 缺「类型: 」前缀的 rc", rc, 1)
+    check("阴性 msg 缺前缀 被判据项拒绝", items(rs, "FAIL"), ["commit 注释格式"])
+
+    rc, rs = run(cmd_msg, message="   ")
+    check("阴性 msg 空提交信息的 rc", rc, 1)
+
+    # 语法：`<类型>[(<范围>)][!]: <描述>` —— `!` 在 scope **之后**（见 _MSG_RE）
+    rc, rs = run(cmd_msg, message="fix(api)!: 修正汇率漏乘含税系数")
+    check("msg scope+breaking 扩展仍合法", rc, 0)
+
+    rc, rs = run(cmd_msg, message="docs: update")
+    check("msg 无信息描述只 WARN 不 FAIL", (count(rs, "WARN"), count(rs, "FAIL"), rc), (1, 0, 0))
+
+    code, _ = _git(["--version"], Path("."))
+    check("前置：git 可用（否则分支用例判 MISS）", code, 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+
+        # ② .gitignore 覆盖率
+        d = base / "no-gitignore"
+        d.mkdir()
+        rc, rs = run(cmd_ignore, repo=str(d))
+        check("ignore 无 .gitignore → SKIP 不算通过", (rc, count(rs, "SKIP"), count(rs, "OK")), (0, 1, 0))
+
+        d = base / "full"
+        d.mkdir()
+        (d / ".gitignore").write_text("*.pt\ndata/\nvenv/\n*.log\n.env\n", encoding="utf-8")
+        rc, rs = run(cmd_ignore, repo=str(d))
+        check("ignore 五类齐备的 rc", rc, 0)
+        check("ignore 五类齐备的覆盖 OK 数",
+              sum(1 for i in items(rs, "OK") if i.startswith("禁止提交覆盖")), 5)
+
+        d = base / "partial"
+        d.mkdir()
+        (d / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        rc, rs = run(cmd_ignore, repo=str(d))
+        check("阴性 ignore 只覆盖日志的 rc", rc, 1)
+        check("阴性 ignore 只覆盖日志 漏报 4 类",
+              sum(1 for i in items(rs, "FAIL") if i.startswith("禁止提交覆盖")), 4)
+
+        # ③ 分支状态（假仓：只 init + symbolic-ref，无 commit）
+        def mk_repo(name, branch, dirty=False, ignore=False):
+            repo = base / name
+            repo.mkdir()
+            _git(["init", "-q"], repo)
+            _git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], repo)
+            if dirty:
+                (repo / "wip.txt").write_text("x", encoding="utf-8")
+            if ignore:
+                (repo / ".gitignore").write_text("*.pt\ndata/\nvenv/\n*.log\n.env\n",
+                                                 encoding="utf-8")
+            return repo
+
+        repo = mk_repo("repo-dev", "dev")
+        rc, rs = run(cmd_branch, repo=str(repo))
+        check("branch dev 属开发线的 rc", rc, 0)
+        check("branch dev 命中分支保护（规则①）", "分支保护（规则①）" in items(rs, "OK"), True)
+
+        repo = mk_repo("repo-main-dirty", "main", dirty=True)
+        rc, rs = run(cmd_branch, repo=str(repo))
+        check("branch main+未提交改动 → WARN 非 FAIL",
+              (count(rs, "WARN"), count(rs, "FAIL"), rc), (1, 0, 0))
+
+        repo = mk_repo("repo-feature", "feature/x")
+        rc, rs = run(cmd_branch, repo=str(repo))
+        check("阴性 branch feature/x 命名越界 → WARN",
+              ("分支命名" in items(rs, "WARN"), rc), (True, 0))
+
+        d = base / "not-a-repo"
+        d.mkdir()
+        rc, rs = run(cmd_branch, repo=str(d))
+        check("branch 非 git 目录 → SKIP 不算通过", (rc, count(rs, "SKIP"), count(rs, "OK")),
+              (0, 1, 0))
+
+        # ④ 综合预检：分支 + 覆盖两段都要跑到
+        repo = mk_repo("repo-preflight", "dev", ignore=True)
+        rc, rs = run(cmd_preflight, repo=str(repo))
+        check("preflight 两段判据都产出（分支 + 覆盖）",
+              ("分支保护（规则①）" in items(rs, "OK"),
+               sum(1 for i in items(rs, "OK") if i.startswith("禁止提交覆盖")) == 5, rc),
+              (True, True, 0))
+
+    print(f"=== selftest：{n_pass}/{n_all} ===")
+    return 0 if n_pass == n_all else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="git_check.py",
@@ -304,6 +439,15 @@ def main() -> int:
     p4 = sub.add_parser("preflight", help="综合预检（branch + ignore）")
     p4.add_argument("--repo", default=".", help="仓库目录（默认当前目录）")
     p4.set_defaults(handler=cmd_preflight)
+
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检（含阴性对照；只用临时目录，不触碰真实仓库）")
+
+    # ⚠️ 子命令是 required=True，故 `--selftest` 必须在 parse_args **之前**拦下 —— 否则裸
+    #    `--selftest` 会先被「缺少子命令」报错（rc=2）顶掉。只认**首个参数**就是它这一种形态，
+    #    子命令内的位置参数里出现同名 token 不会被误拦。
+    if sys.argv[1:2] == ["--selftest"]:
+        return _selftest()
 
     args = ap.parse_args()
     code = args.handler(args)
