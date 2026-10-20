@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 # [自研工具] memory_handoff.py
 # 用途：ai-workflow 记忆写入、交接与共享导出引擎 —— 把任务收尾整理出的交接文档 / 会话记忆落位到知识库
-#       40-记忆 区（含结构校验、幂等备份），重建记忆索引、输出自升级统计，并把该区只读导出为
-#       宿主可加载的共享快照（pull）。
+#       40-记忆（记忆库）区（含结构校验、幂等备份），重建记忆索引、输出自升级统计，并把该区只读导出为
+#       宿主可加载的共享快照（pull）。2026-10-19 起按「记忆库」两库结构落位：
+#       会话记忆 → 用户记忆库\会话记忆\，交接 → 工作记忆库\交接\，画像 → 用户记忆库\画像\。
+#       2026-10-19 起落位**自带条目契约 frontmatter**（id/kind/layer/scope/status/confidence/
+#       provenance/review，契约见知识库《记忆库第二大脑架构设计》§3.3）；--no-fm 可关。
 # 适用场景：ai-workflow L1／L2 任务阶段 6 收尾，及各宿主开工时刷新共享记忆（见 references/memory-handoff.md）。
 # 作者：ai-workflow 自研（机制-记忆管理与交接自升级-2026-10-16，2026-10-16；pull 导出于 2026-10-16）
 # 仓库：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/memory_handoff.py
@@ -12,12 +15,12 @@
 """[自研工具] memory_handoff —— ai-workflow 记忆写入、交接与共享导出引擎
 用途：把任务收尾整理出的交接文档 / 会话记忆落位到知识库 40-记忆 区（含结构校验、幂等备份），
      重建记忆索引、输出自升级统计，并把该区只读导出成宿主可加载的共享快照。语义（内容撰写）归模型，
-     算术与判据（路径/校验/备份/计数/指纹）归本脚本。
+     算术与判据（路径/校验/备份/计数/指纹）归本脚本。落位时自动写条目契约 frontmatter（--no-fm 可关）。
 适用场景：ai-workflow L1／L2 任务阶段 6 收尾（手动触发，见 references/memory-handoff.md）
 仓库：https://github.com/Garvin666/ai-workflow-tools
 
 子命令：
-  place   落位一篇交接/会话记忆（结构校验 → 备份 → 写入）
+  place   落位一篇交接/会话记忆（结构校验 → 备份 → 写契约块 → 写入）
   index   重建 40-记忆/00-记忆索引.md（按项目分组，幂等）
   pull    只读导出共享快照（内容指纹幂等；写面不碰 40-记忆）
   stats   输出统计 JSON（供自升级决策）
@@ -34,11 +37,26 @@ import re
 import shutil
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 DEFAULT_ROOT = Path(r"E:\ChatGPT\知识库\40-记忆")
-KIND_DIR = {"handoff": "交接", "memory": "会话记忆"}
+
+# ---- 记忆库两库结构（2026-10-19 起；口径见知识库 40-记忆\README.md）----
+# 用户记忆库记「人」，工作记忆库记「活儿」；两棵子树互不写入。
+USER_LIB = "用户记忆库"
+WORK_LIB = "工作记忆库"
+KIND_DIR = {"handoff": f"{WORK_LIB}/交接", "memory": f"{USER_LIB}/会话记忆"}
+LAYER_DIR = {
+    "交接": f"{WORK_LIB}/交接",
+    "会话记忆": f"{USER_LIB}/会话记忆",
+    "画像": f"{USER_LIB}/画像",
+}
+#: 2026-10-16 前平铺的存量，拆分后绝对路径为 用户记忆库/会话记忆/*.md
+LEGACY_DIR = f"{USER_LIB}/会话记忆"
+CORRECTION_FILE = f"{WORK_LIB}/纠错账本.md"
+INDEX_FILE = "00-记忆索引.md"
+
 
 # pull 的分层取舍（口径同 references/memory-handoff.md §导出轨）：
 # 画像与索引是「每次开工都该读」的稳定层，流水层按项目只取最近 N 篇。
@@ -109,6 +127,161 @@ def backup_file(p: Path) -> Path | None:
     return b
 
 
+# ---- 条目契约 frontmatter（2026-10-19 起；契约见知识库《记忆库第二大脑架构设计》§3.3）----
+# 落位即自带契约块，不再依赖「收尾时记得手工跑一次 mem fm」。
+# 本脚本**自实现**这段序列化、不 import 知识库里的 mem.py：技能要能在任何工作区独立运行。
+# 代价是同一套格式有两处实现 ⇒ 用真实产物做互锁：mem.py 的自检会读取
+# 30-产出/记忆库工具/fixtures/place-产物.md（本脚本 place 的**真实**输出）并跑契约校验，
+# 格式一旦漂移，mem.py selftest 立刻变红。
+FM_KIND = {"handoff": ("handoff", "M1"), "memory": ("record", "M1")}
+FM_HALF_LIFE = {"handoff": 90, "record": 90}
+#: 与 mem.py 的 _ID_BAD 保持同源：空白、路径分隔符，以及会破坏 YAML 纯量 /
+#: flow map / wiki 链接的元字符。中文、希腊字母、全角括号一律放行。
+FM_ID_BAD = set(" \t\r\n,{}[]#&*!|>'\"%@`/\\:?<>")
+#: 关系枚举（契约 §3.3 五种）。place --link 只允许这五种，不让人手打自造关系。
+FM_RELATIONS = ("supersedes", "refines", "contradicts", "derived_from", "applies_to")
+
+
+def fm_split_block(text: str):
+    """字节精确切出首块 frontmatter，返回 (block|None, rest)。未闭合按「没有块」处理。
+
+    不用正则：回填/落位的不变量是「正文一个字节都不许变」，需要一个能原样还原文的切法。
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None, text
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "".join(lines[:i + 1]), "".join(lines[i + 1:])
+    return None, text
+
+
+def fm_foreign_lines(block: str | None) -> list[str]:
+    """外来 frontmatter 的内部原始行（逐字保留，不重排不重格式化）。"""
+    if block is None:
+        return []
+    out = list(block.splitlines(keepends=True)[1:-1])
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    return out
+
+
+def fm_build(*, kind: str, project: str, task: str, when: str, hhmm: str,
+             src: str) -> str:
+    """生成契约块。字段顺序与 mem.py 的 build_frontmatter 一致，保证 diff 稳定。"""
+    ck, layer = FM_KIND[kind]
+    eid = re.sub(r"\s+", "-", f"{when}-{hhmm}-{task}".strip())
+    eid = "".join("-" if c in FM_ID_BAD else c for c in eid)
+    hl = FM_HALF_LIFE[ck]
+    try:
+        nxt = (datetime.strptime(when, "%Y-%m-%d")
+               + timedelta(days=hl)).strftime("%Y-%m-%d")
+    except ValueError:
+        nxt = ""
+    ref = Path(src).as_posix()          # 用 / 而非 \：反斜杠在 YAML 里要转义
+    at = f"{when}T{hhmm[:2]}:{hhmm[2:]}" if len(hhmm) == 4 else f"{when}T{hhmm}"
+    out = ["---",
+           f"id: mem-{ck}-{eid}",
+           f"kind: {ck}",
+           f"layer: {layer}",
+           f"scope: project:{project}",
+           "status: active",
+           "confidence: 1",
+           "provenance:",
+           "  source: task",
+           f"  ref: {ref}",
+           f"  at: {at}",
+           "review:",
+           f"  half_life_d: {hl}",
+           "  pinned: false"]
+    if nxt:
+        out.append(f"  next_check: {nxt}")
+    out.append("---")
+    return "\n".join(out) + "\n"
+
+
+def fm_apply(text: str, *, kind: str, project: str, task: str, when: str,
+             hhmm: str, src: str):
+    """把契约块贴到正文前。返回 (新全文, 状态说明)。
+
+    三条幂等语义（对应 selftest fixture 14–16）：
+      · 草稿已带含 id 的契约块 → 原样沿用，不再叠一块（二次 place 不叠加）
+      · 草稿带无 id 的外来块（tags/created 这类自用注释）→ 外来行逐字保留，契约段在前
+      · 没有块 → 直接加
+    """
+    block, rest = fm_split_block(text)
+    if block is not None:
+        inner = block.splitlines()[1:-1]
+        if any(re.match(r"^id\s*:", ln) for ln in inner):
+            return text, "沿用草稿自带契约块"
+        foreign = fm_foreign_lines(block)
+        return (fm_build(kind=kind, project=project, task=task, when=when,
+                         hhmm=hhmm, src=src)
+                + "".join(foreign) + rest), "已加块并保留外来字段"
+    return (fm_build(kind=kind, project=project, task=task, when=when,
+                     hhmm=hhmm, src=src) + text), "已加块"
+
+
+def fm_insert_links(text: str, links: list[tuple[str, str]]) -> str:
+    """把 {rel, id} 追加进已有的契约块。同一条不重复写。
+
+    为什么不是在 fm_build 里拼：place 有「草稿已带契约块就沿用」这条幂等语义
+    （fixture 14），那时块不是我们生成的，只能在事后往里插 —— 两路都得覆盖。
+    """
+    block, rest = fm_split_block(text)
+    if block is None:
+        return text
+    lines = block.splitlines(keepends=True)
+    if len(lines) < 3:
+        return text
+    close = len(lines) - 1
+    todo = []
+    for rel, dst in links:
+        want = f"{{rel: {rel}, id: {dst}}}"
+        if any(l.strip().startswith("- {") and f"rel: {rel}" in l and f"id: {dst}" in l
+               for l in lines[1:close]):
+            continue
+        todo.append(want)
+    if not todo:
+        return text
+    for i in range(1, close):
+        if lines[i].rstrip("\r\n") == "links:":
+            last = i
+            for j in range(i + 1, close):
+                if lines[j][:1] in (" ", "\t"):
+                    last = j
+                elif lines[j].strip():
+                    break
+            if not lines[last].endswith("\n"):
+                lines[last] += "\n"
+            for k, want in enumerate(todo):
+                lines.insert(last + 1 + k, f"  - {want}\n")
+            return "".join(lines) + rest
+    seg = ["links:\n"] + [f"  - {w}\n" for w in todo]
+    for i in range(1, close):
+        if lines[i].rstrip("\r\n") == "provenance:":      # 按契约字段序插在前面
+            lines[i:i] = seg
+            return "".join(lines) + rest
+    lines[close:close] = seg
+    return "".join(lines) + rest
+
+
+def fm_parse_links(raw: list[str] | None) -> tuple[list[tuple[str, str]], list[str]]:
+    """`rel:id` 列表 → [(rel, id)]，同时把不合法项挑出来（不静默丢）。"""
+    good, bad = [], []
+    for item in raw or []:
+        if ":" not in item:
+            bad.append(item)
+            continue
+        rel, dst = item.split(":", 1)
+        rel, dst = rel.strip(), dst.strip()
+        if rel not in FM_RELATIONS or not dst:
+            bad.append(item)
+            continue
+        good.append((rel, dst))
+    return good, bad
+
+
 def cmd_place(args) -> int:
     root = Path(args.root)
     src = Path(args.src)
@@ -144,22 +317,40 @@ def cmd_place(args) -> int:
     if args.dry_run:
         print(f"[DRY] 将写入：{dest}（校验已过；备份：{'有' if dest.exists() else '无'}）")
         return 0
+    out_text = text
+    fm_note = "关闭（--no-fm）"
+    if not getattr(args, "no_fm", False):
+        out_text, fm_note = fm_apply(text, kind=args.kind, project=args.project,
+                                     task=args.task, when=when, hhmm=hhmm,
+                                     src=args.src)
+        links, bad_links = fm_parse_links(getattr(args, "link", None))
+        if bad_links:
+            print(f"[ERR] --link 不合法：{bad_links}（格式 rel:id，"
+                  f"rel 须为 {'/'.join(FM_RELATIONS)}）—— 未写入")
+            return 2
+        if links:
+            before = out_text
+            out_text = fm_insert_links(out_text, links)
+            added = sum(1 for l in out_text.splitlines() if l.strip().startswith("- {rel:")) \
+                - sum(1 for l in before.splitlines() if l.strip().startswith("- {rel:"))
+            fm_note += f"；links 新增 {added} 条"
     dest_dir.mkdir(parents=True, exist_ok=True)
     b = backup_file(dest)
     with open(dest, "w", encoding="utf-8", newline="") as f:
-        f.write(text)  # ⚠️ newline=""：逐字节保真，禁行尾转换（同读侧，2026-10-16 修）
-    line_count = len(text.splitlines())
+        f.write(out_text)  # ⚠️ newline=""：逐字节保真，禁行尾转换（同读侧，2026-10-16 修）
+    line_count = len(out_text.splitlines())
     print(f"[OK] 已写入：{dest}")
     print(f"     行数 {line_count} ｜ 字节 {dest.stat().st_size}"
           + (f" ｜ 旧版备份：{b.name}" if b else " ｜ 无旧版"))
+    print(f"     条目契约：{fm_note}")
     return 0
 
 
 def scan(root: Path) -> dict:
-    """扫描 40-记忆：分层新文件 + 平铺存量。"""
+    """扫描记忆库：两库分层新文件 ＋ 平铺存量。"""
     out: dict = {"交接": {}, "会话记忆": {}, "存量平铺": []}
     for kind_dir in ("交接", "会话记忆"):
-        d = root / kind_dir
+        d = root / LAYER_DIR[kind_dir]
         if not d.is_dir():
             continue
         for proj in sorted(p for p in d.iterdir() if p.is_dir()):
@@ -167,50 +358,84 @@ def scan(root: Path) -> dict:
                            if ".bak" not in f.name)
             if files:
                 out[kind_dir][proj.name] = [f.name for f in files]
-    legacy = root / "会话记忆"
+    legacy = root / LEGACY_DIR
     if legacy.is_dir():
         out["存量平铺"] = sorted(
             f.name for f in legacy.glob("*.md") if ".bak" not in f.name)
     return out
 
 
+def legacy_residue(root: Path) -> list[str]:
+    """旧路径残渣：两库化（2026-10-19）之后仍写在根级 `<层>/` 的 .md。
+
+    多宿主各持一份引擎，旧副本按旧路径写入不会报错；而 index/stats 只扫两库
+    ⇒ 残渣「静默不可见」。这里只报警、不搬动（搬动属结构性操作，须人工确认）。
+    """
+    stale: list[str] = []
+    for layer in ("会话记忆", "交接", "画像"):
+        d = root / layer
+        if not d.is_dir():
+            continue
+        for f in sorted(d.rglob("*.md")):
+            if ".bak" not in f.name:
+                stale.append(f.relative_to(root).as_posix())
+    return stale
+
+
+def warn_legacy(root: Path) -> list[str]:
+    stale = legacy_residue(root)
+    if stale:
+        print(f"[WARN] 检出旧路径残渣 {len(stale)} 个（旧版引擎或旧文档按根级层目录写入，"
+              f"两库索引不会收录）：")
+        for s in stale:
+            print(f"       - {s}")
+        print("       处置：人工确认后按 `用户记忆库/会话记忆/`（会话记忆、画像）或 "
+              "`工作记忆库/交接/`（交接）归位，再跑 index。")
+    return stale
+
+
 def cmd_index(args) -> int:
     root = Path(args.root)
+    stale = warn_legacy(root)
     data = scan(root)
     lines = [
-        "# 40-记忆 · 记忆索引（自动生成，勿手改）",
+        "# 40-记忆 · 记忆库索引（自动生成，勿手改）",
         "",
         # ⚠️ 头部刻意**不含时间戳**：这段内容要拿去做「与磁盘逐字比较」的幂等判据，
         #    掺入任何随时间变化的字段（如 now()）会让该判据恒假 ⇒ 每次运行都重写 + 堆 .bak
         #    （2026-10-16 实测：一日内累积 9 个 .bak；同仓 gen_skill_index.py 的指纹亦刻意
         #     不含 mtime —— 同一口径）。最后重建时间看本文件 mtime 即可。
         "> 由 ai-workflow `memory_handoff.py index` 重建 ｜ 内容＝文件清单的纯函数（不含时间戳，清单不变则不重写）。",
-        "> 分层规则：`<类型>/<项目>/<日期>-<任务>.md`；项目名 = 任务工作区名。",
+        "> 分层规则：`<库>/<层>/<项目>/<日期>-<任务>.md`；项目名 = 任务工作区名；两库＝用户记忆库（记人）/ 工作记忆库（记活儿）。",
         "",
     ]
-    for kind_dir in ("交接", "会话记忆"):
-        lines.append(f"## {kind_dir}")
+    for lib, kinds in ((USER_LIB, ("会话记忆",)), (WORK_LIB, ("交接",))):
+        lines.append(f"## {lib}")
         lines.append("")
-        groups = data.get(kind_dir, {})
-        if not groups:
-            lines.append("（暂无）")
-            lines.append("")
-            continue
-        for proj, files in groups.items():
-            lines.append(f"### {proj}（{len(files)}）")
-            lines.append("")
-            for f in files:
-                date = f[:10]
-                stem = f[:-3]
-                lines.append(f"- {date} ｜ [[{kind_dir}/{proj}/{stem}\\|{stem[11:]}]]")
-            lines.append("")
+        for kind_dir in kinds:
+            groups = data.get(kind_dir, {})
+            if not groups:
+                lines.append(f"### {kind_dir}")
+                lines.append("")
+                lines.append("（暂无）")
+                lines.append("")
+                continue
+            for proj, files in groups.items():
+                lines.append(f"### {kind_dir} · {proj}（{len(files)}）")
+                lines.append("")
+                for f in files:
+                    date = f[:10]
+                    stem = f[:-3]
+                    lines.append(
+                        f"- {date} ｜ [[{LAYER_DIR[kind_dir]}/{proj}/{stem}\\|{stem[11:]}]]")
+                lines.append("")
     legacy = data.get("存量平铺", [])
     if legacy:
         lines.append("## 存量平铺（2026-10-16 前，未分层，原位保留）")
         lines.append("")
         for f in legacy:
             stem = f[:-3]
-            lines.append(f"- [[会话记忆/{stem}\\|{f}]]")
+            lines.append(f"- [[{LEGACY_DIR}/{stem}\\|{f}]]")
         lines.append("")
     if args.dry_run:
         print(f"[DRY] 索引将含：交接 {sum(len(v) for v in data.get('交接', {}).values())} 篇 ｜ "
@@ -232,31 +457,39 @@ def cmd_index(args) -> int:
 
 def cmd_stats(args) -> int:
     root = Path(args.root)
+    stale = legacy_residue(root)
     data = scan(root)
     handoff_n = sum(len(v) for v in data.get("交接", {}).values())
     memory_n = sum(len(v) for v in data.get("会话记忆", {}).values())
     legacy_n = len(data.get("存量平铺", []))
-    correction = root / "纠错账本.md"
+    correction = root / CORRECTION_FILE
     corr_lines = 0
     if correction.exists():
         corr_lines = sum(1 for ln in correction.read_text(encoding="utf-8").splitlines()
                          if ln.strip().startswith("|") and "---" not in ln)
-    profile = list((root / "画像").glob("*.md")) if (root / "画像").is_dir() else []
+    profile_dir = root / LAYER_DIR["画像"]
+    profile = list(profile_dir.glob("*.md")) if profile_dir.is_dir() else []
     out = {
         "root": str(root),
+        "库": {USER_LIB: ["会话记忆", "问答记忆", "画像"],
+               WORK_LIB: ["交接", "经验沉淀", "纠错账本"]},
         "交接": {"projects": len(data.get("交接", {})), "files": handoff_n},
         "会话记忆": {"projects": len(data.get("会话记忆", {})), "files": memory_n},
         "存量平铺": legacy_n,
         "纠错账本": {"exists": correction.exists(), "table_rows": corr_lines},
         "画像": [p.name for p in profile],
+        "旧路径残渣": stale,
         "thresholds": {"会话记忆单项目": 10, "交接单项目": 10},
         "suggestions": [],
     }
-    if memory_n + legacy_n >= 20 and not (root / "00-记忆索引.md").exists():
+    if memory_n + legacy_n >= 20 and not (root / INDEX_FILE).exists():
         out["suggestions"].append("记忆合计 ≥20 篇且无索引 ⇒ 跑 index 重建")
     for proj, files in data.get("交接", {}).items():
         if len(files) >= out["thresholds"]["交接单项目"]:
             out["suggestions"].append(f"交接/{proj} 已达 {len(files)} 篇 ⇒ 归属/归档回顾提案")
+    if stale:
+        out["suggestions"].append(
+            f"检出旧路径残渣 {len(stale)} 个 ⇒ 按两库归位后重建索引")
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -271,16 +504,16 @@ def pull_sources(root: Path, kinds: list[str], project: str | None,
     items: list[tuple[str, str]] = []
     for kind in kinds:
         if kind == "索引":
-            p = root / "00-记忆索引.md"
+            p = root / INDEX_FILE
             if p.is_file():
                 items.append(("40-记忆/00-记忆索引.md", read_exact(p)))
         elif kind == "画像":
-            d = root / "画像"
+            d = root / LAYER_DIR["画像"]
             if d.is_dir():
                 for f in sorted(x for x in d.glob("*.md") if ".bak" not in x.name):
-                    items.append((f"40-记忆/画像/{f.name}", read_exact(f)))
+                    items.append((f"40-记忆/{LAYER_DIR['画像']}/{f.name}", read_exact(f)))
         else:
-            base = root / kind
+            base = root / LAYER_DIR[kind]
             if not base.is_dir():
                 continue
             for pd in sorted(x for x in base.iterdir() if x.is_dir()):
@@ -289,7 +522,8 @@ def pull_sources(root: Path, kinds: list[str], project: str | None,
                 files = sorted(f for f in pd.glob("*.md") if ".bak" not in f.name)
                 take = files[-recent:] if recent > 0 else []
                 for f in take:
-                    items.append((f"40-记忆/{kind}/{pd.name}/{f.name}", read_exact(f)))
+                    items.append(
+                        (f"40-记忆/{LAYER_DIR[kind]}/{pd.name}/{f.name}", read_exact(f)))
     return items
 
 
@@ -312,9 +546,10 @@ def render_pull(root: Path, kinds: list[str], project: str | None, recent: int,
                            *(b for _, b in blocks)]).encode("utf-8")
     fp = hashlib.sha256(payload).hexdigest()[:16]
     head = [
-        "# 40-记忆 · 共享快照（自动生成，勿手改）",
+        "# 40-记忆 · 记忆库共享快照（自动生成，勿手改）",
         "",
         f"> 来源：`{root}` ｜ 生成：`memory_handoff.py pull` ｜ **只读导出**，写回一律走 `place`。",
+        f"> 结构：用户记忆库（会话记忆 / 问答记忆 / 画像）＋ 工作记忆库（交接 / 经验沉淀 / 纠错账本）。",
         f"> 内容指纹：`sha256:{fp}` —— 只在**源正文或分层参数变化**时才变；头部不含时间戳，"
         "故同输入复跑不重写（与 `index` 的幂等口径同源）。",
         f"> 覆盖：{', '.join(kinds)}（流水层每项目最近 {recent} 篇）｜ 纳入 {len(blocks)} 条"
@@ -392,7 +627,7 @@ def cmd_selftest(_args) -> int:
             task="样例任务", date="2026-10-16", time="1200", dry_run=False))
         if rc != 0:
             fails.append("fixture1 合法交接 place 应 rc=0")
-        dest = root / "交接" / "样例项目" / "2026-10-16-1200-样例任务.md"
+        dest = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1200-样例任务.md"
         if not dest.is_file():
             fails.append("fixture1 产物未落位")
 
@@ -405,7 +640,7 @@ def cmd_selftest(_args) -> int:
             task="坏样例", date="2026-10-16", time="1200", dry_run=False))
         if rc2 != 1:
             fails.append(f"fixture2 缺节应 rc=1，实得 {rc2}")
-        if (root / "交接" / "样例项目" / "2026-10-16-1200-坏样例.md").exists():
+        if (root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1200-坏样例.md").exists():
             fails.append("fixture2 非法内容不应落位")
 
         # fixture 3：五段式会话记忆合法
@@ -424,14 +659,14 @@ def cmd_selftest(_args) -> int:
         rc4 = cmd_place(argparse.Namespace(
             root=str(root), src=str(m), kind="memory", project="样例项目",
             task="样例记忆", date="2026-10-16", time="1201", dry_run=False))
-        baks = list((root / "会话记忆" / "样例项目").glob("*.bak-*"))
+        baks = list((root / LAYER_DIR["会话记忆"] / "样例项目").glob("*.bak-*"))
         if rc4 != 0 or not baks:
             fails.append("fixture4 二次 place 应成功且产生 .bak 备份")
 
         # fixture 5：index 幂等（连跑两次第二次报无变化）+ 含条目
         rc5 = cmd_index(argparse.Namespace(root=str(root), dry_run=False))
         rc6 = cmd_index(argparse.Namespace(root=str(root), dry_run=False))
-        idx = root / "00-记忆索引.md"
+        idx = root / INDEX_FILE
         if rc5 != 0 or rc6 != 0 or not idx.is_file():
             fails.append("fixture5 index 连跑两次应 rc=0 且产出索引")
         if idx.is_file() and "样例任务" not in idx.read_text(encoding="utf-8"):
@@ -456,8 +691,9 @@ def cmd_selftest(_args) -> int:
             f.write("# 交接｜行尾样例\n\n## 一、内容\nA\n\n## 二、结果\nB\n\n## 三、后续\nC\n")
         rc8 = cmd_place(argparse.Namespace(
             root=str(root), src=str(src7), kind="handoff", project="样例项目",
-            task="行尾保真", date="2026-10-16", time="1202", dry_run=False))
-        dest7 = root / "交接" / "样例项目" / "2026-10-16-1202-行尾保真.md"
+            task="行尾保真", date="2026-10-16", time="1202", dry_run=False,
+            no_fm=True))   # 这条只验行尾保真，故关掉契约块（加块后整文件必然不等于源）
+        dest7 = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1202-行尾保真.md"
         if rc8 != 0:
             fails.append("fixture7 行尾保真 place 应 rc=0")
         elif dest7.read_bytes() != src7.read_bytes():
@@ -474,16 +710,93 @@ def cmd_selftest(_args) -> int:
         if "WARN" not in buf2.getvalue():
             fails.append("fixture8 同日同任务异时间应打印 WARN（防静默重复）")
 
+        # fixture 14：默认落位自带契约块，且**去掉首块后正文逐字节相同**（只动头部）
+        rc14 = cmd_place(argparse.Namespace(
+            root=str(root), src=str(src7), kind="handoff", project="样例项目",
+            task="带块样例", date="2026-10-16", time="1206", dry_run=False))
+        dest14 = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1206-带块样例.md"
+        if rc14 != 0 or not dest14.is_file():
+            fails.append("fixture14 默认 place 应 rc=0 且落位")
+        else:
+            blk, rest = fm_split_block(dest14.read_text(encoding="utf-8"))
+            if blk is None:
+                fails.append("fixture14 默认落位应自带契约块")
+            elif rest != src7.read_text(encoding="utf-8"):
+                fails.append("fixture14 加块后正文必须逐字节不变")
+            else:
+                first = blk.splitlines()[1] if len(blk.splitlines()) > 1 else ""
+                if not first.startswith("id: mem-handoff-2026-10-16-1206-带块样例"):
+                    fails.append(f"fixture14 id 行不符：{first!r}")
+
+        # fixture 15：二次 place 不叠加 —— 拿已带契约块的产物当草稿再落一次
+        # （同一文件既当 src 又当 dest：块已在 ⇒ 必须原样沿用，不出现第二块）
+        src15 = root / "src-already.md"
+        blk14, rest14 = fm_split_block(dest14.read_text(encoding="utf-8")) \
+            if dest14.is_file() else (None, "")
+        src15.write_text((blk14 or "") + rest14, encoding="utf-8")
+        rc15 = cmd_place(argparse.Namespace(
+            root=str(root), src=str(src15), kind="handoff", project="样例项目",
+            task="已带块", date="2026-10-16", time="1204", dry_run=False))
+        dest15 = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1204-已带块.md"
+        got15 = dest15.read_text(encoding="utf-8") if dest15.is_file() else ""
+        if rc15 != 0 or got15.count("\nid: mem-") != 1:
+            fails.append(f"fixture15 二次 place 不应叠加第二块（实得 {got15.count(chr(10)+'id: mem-')} 个 id）")
+
+        # fixture 16：草稿带无 id 的外来块 → 外来字段逐字保留，契约段在前
+        src16 = root / "src-foreign.md"
+        src16.write_text("---\ntags: [交接]\n项目: 样例项目\n---\n"
+                         "# 交接｜外来块样例\n\n## 一、内容\nA\n\n## 二、结果\nB\n\n## 三、后续\nC\n",
+                         encoding="utf-8")
+        rc16 = cmd_place(argparse.Namespace(
+            root=str(root), src=str(src16), kind="handoff", project="样例项目",
+            task="外来块", date="2026-10-16", time="1205", dry_run=False))
+        dest16 = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1205-外来块.md"
+        got16 = dest16.read_text(encoding="utf-8") if dest16.is_file() else ""
+        if rc16 != 0 or "tags: [交接]" not in got16 or "项目: 样例项目" not in got16:
+            fails.append("fixture16 外来 frontmatter 字段应逐字保留")
+        if got16 and got16.index("---", 4) > got16.index("tags:"):
+            fails.append("fixture16 外来字段应落在契约段之后")
+
+        # fixture 17：place --link 写进契约块，且落在 provenance 之前（契约字段序）
+        rc17 = cmd_place(argparse.Namespace(
+            root=str(root), src=str(src7), kind="handoff", project="样例项目",
+            task="带链接", date="2026-10-16", time="1207", dry_run=False,
+            link=["derived_from:mem-handoff-2026-10-16-1206-带块样例",
+                  "refines:mem-record-2026-10-16-1206-带块样例"]))
+        dest17 = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1207-带链接.md"
+        got17 = dest17.read_text(encoding="utf-8") if dest17.is_file() else ""
+        if rc17 != 0 or got17.count("- {rel:") != 2:
+            fails.append(f"fixture17 --link 应写进 2 条（实得 {got17.count('- {rel:')}）")
+        if got17 and not (got17.index("links:") < got17.index("provenance:")):
+            fails.append("fixture17 links 块应在 provenance 之前（与 build_frontmatter 同序）")
+        if got17 and "derived_from" not in got17:
+            fails.append("fixture17 关系名丢了")
+
+        # fixture 18：--link 非法关系要硬拒，且**不落位**（不能留半个文件）
+        src18 = root / "src-badlink.md"
+        src18.write_text(src7.read_text(encoding="utf-8"), encoding="utf-8")
+        buf18 = io.StringIO()
+        with contextlib.redirect_stdout(buf18):
+            rc18 = cmd_place(argparse.Namespace(
+                root=str(root), src=str(src18), kind="handoff", project="样例项目",
+                task="坏链接", date="2026-10-16", time="1208", dry_run=False,
+                link=["覆盖:mem-x"]))
+        dest18 = root / LAYER_DIR["交接"] / "样例项目" / "2026-10-16-1208-坏链接.md"
+        if rc18 != 2:
+            fails.append(f"fixture18 非法关系应 rc=2，实得 {rc18}")
+        if dest18.exists():
+            fails.append("fixture18 校验失败时不得落位（不允许半个文件）")
+
         # fixture 9–13：pull 只读导出轨（分层取舍 / 幂等 / 阴性对照 / 写面守卫 / 空源与越界拒绝）
         kb = root / "kb"
-        (kb / "画像").mkdir(parents=True)
-        (kb / "交接" / "样例项目").mkdir(parents=True)
-        with open(kb / "画像" / "做事方式.md", "w", encoding="utf-8", newline="") as f:
+        (kb / LAYER_DIR["画像"]).mkdir(parents=True)
+        (kb / LAYER_DIR["交接"] / "样例项目").mkdir(parents=True)
+        with open(kb / LAYER_DIR["画像"] / "做事方式.md", "w", encoding="utf-8", newline="") as f:
             f.write("# 画像｜做事方式\n\n- 2026-10-16 测试条目\n")
         with open(kb / "00-记忆索引.md", "w", encoding="utf-8", newline="") as f:
             f.write("# 索引\n\n- 样例\n")
         for hhmm in ("1200", "1201", "1202"):
-            with open(kb / "交接" / "样例项目" / f"2026-10-16-{hhmm}-样例任务.md",
+            with open(kb / LAYER_DIR["交接"] / "样例项目" / f"2026-10-16-{hhmm}-样例任务.md",
                       "w", encoding="utf-8", newline="") as f:
                 f.write(f"# 交接\n\n## 内容\nA{hhmm}\n\n## 结果\nB\n\n## 后续\nC\n")
         snap = root / "snapshot.md"
@@ -517,7 +830,7 @@ def cmd_selftest(_args) -> int:
             fails.append("fixture10 派生缓存不得堆 .bak")
 
         # 阴性对照：翻一个字节 ⇒ 指纹必须变、必须重写（证明幂等判据不是恒真）
-        with open(kb / "画像" / "做事方式.md", "w", encoding="utf-8", newline="") as f:
+        with open(kb / LAYER_DIR["画像"] / "做事方式.md", "w", encoding="utf-8", newline="") as f:
             f.write("# 画像｜做事方式\n\n- 2026-10-16 测试条目X\n")
         buf5 = io.StringIO()
         with contextlib.redirect_stdout(buf5):
@@ -543,8 +856,9 @@ def cmd_selftest(_args) -> int:
         for f in fails:
             print(f"  - {f}")
         return 1
-    print("[OK] selftest 全绿（13 组 fixture：合法×3 / 阴性对照×2 / 幂等×3 / JSON×1 / "
-          "行尾保真×1 / 防重复 WARN×1 / 写面守卫×1 / 空源与越界拒绝×1）")
+    print("[OK] selftest 全绿（18 组 fixture：合法×3 / 阴性对照×2 / 幂等×3 / JSON×1 / "
+          "行尾保真×1(--no-fm) / 防重复 WARN×1 / 条目契约×3 / 写面守卫×1 / 空源与越界拒绝×1 / "
+          "links 写入与拒收×2）")
     return 0
 
 
@@ -562,6 +876,11 @@ def main() -> int:
     p.add_argument("--date", default=None, help="YYYY-MM-DD（缺省今天）")
     p.add_argument("--time", default=None, help="HHMM（缺省当前）")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-fm", dest="no_fm", action="store_true",
+                   help="不写条目契约 frontmatter（默认写；仅在逐字节比对等场合关掉）")
+    p.add_argument("--link", action="append", metavar="REL:ID",
+                   help="追加一条条目关系，可重复（如 derived_from:mem-handoff-...）；"
+                        f"rel 须为 {'/'.join(FM_RELATIONS)}")
     p.set_defaults(func=cmd_place)
 
     for name, fn, helptext in (
