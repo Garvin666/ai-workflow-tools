@@ -570,6 +570,155 @@ def cmd_push(a) -> int:
     return rc
 
 
+# --------------------------------------------------------------------------- #
+# 自检（--selftest）：只跑**不产生外发动作**的判据
+# --------------------------------------------------------------------------- #
+def _st_line(name: str, actual, expect) -> bool:
+    hit = actual == expect
+    print("[%s] %s：实际=%s 期望=%s" % ("PASS" if hit else "MISS", name, actual, expect))
+    return hit
+
+
+def selftest() -> int:
+    """回归四类判据（全部离线；两条推送通道一次都不调用）：
+
+      ① 分流判定：标注头 ∩ 登记（且登记指向工具仓）→ 双属；只有标注头 → 漏登记 FAIL
+      ② 出站扫描前置：命中本机主目录 → FAIL；技能根外路径 → WARN 且不入本体清单
+      ③ 推送清单结构与计数（print_plan 的「本体 N 项 / 自研工具 N 项」两行）
+      ④ fail-closed：`push --apply` 在脏工作区 → rc=1，且 `run()`（通道入口）调用次数为 0
+
+    ⚠️ 夹具是一个 `git init` 出来的假仓，**不设 remote、不 push**；`run()` 被替换成记账
+       闭包，哪怕判据写错走到通道，也只会被计成 MISS 而不会真的发出请求。
+    """
+    import contextlib
+    import io
+    import tempfile
+    from types import SimpleNamespace
+
+    ok_n = total = 0
+
+    def chk(name: str, actual, expect) -> None:
+        nonlocal ok_n, total
+        total += 1
+        if _st_line(name, actual, expect):
+            ok_n += 1
+
+    def hdr(name: str) -> str:
+        return ("#!/usr/bin/env python\n"
+                "# [自研工具] %s\n"
+                "# 用途：selftest 夹具\n"
+                "# 适用场景：selftest 夹具\n"
+                "# 作者：ai-workflow 自研（selftest）\n"
+                "# 仓库：https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/%s\n"
+                % (name, name))
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "tasks" / "demo").mkdir(parents=True)
+        (root / "scripts").mkdir()
+        (root / "README.md").write_text("# demo\n", encoding="utf-8")
+        (root / "SKILL.md").write_text(
+            "---\nname: ai-workflow\nrepo: https://github.com/Garvin666/ai-workflow-skill\n"
+            "selfbuilt: true\n---\n# 技能\n", encoding="utf-8")
+        (root / "scripts" / "tool_ok.py").write_text(hdr("tool_ok.py") + 'print("ok")\n',
+                                                    encoding="utf-8")
+        (root / "scripts" / "orphan.py").write_text(hdr("orphan.py") + 'print("orphan")\n',
+                                                   encoding="utf-8")
+        # 故意放一条「本机主目录路径」以验证出站扫描前置。⚠️ 必须运行时拼接，**不能**写成
+        # 源码字面量：写成字面量会让本脚本自己被出站扫描判 FAIL（自证式假阳性，实测踩到）。
+        leak_seed = "C:" + "\\Users\\Bob\\proj"
+        (root / "scripts" / "leak.py").write_text(
+            hdr("leak.py") + 'SEED = r"%s"\n' % leak_seed, encoding="utf-8")
+        (root / "tasks" / "demo" / "plan.yaml").write_text(
+            "meta:\n"
+            "  自研工具:\n"
+            "    - 名称: tool_ok.py\n"
+            "      用途: 夹具\n"
+            "      适用场景: 夹具\n"
+            "      仓库链接: https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/tool_ok.py\n"
+            "    - 名称: leak.py\n"
+            "      用途: 夹具\n"
+            "      适用场景: 夹具\n"
+            "      仓库链接: https://github.com/Garvin666/ai-workflow-tools/blob/main/scripts/leak.py\n"
+            "    - 名称: ai-workflow 技能本体\n"
+            "      用途: 夹具\n"
+            "      适用场景: 夹具\n"
+            "      仓库链接: https://github.com/Garvin666/ai-workflow-skill/blob/main/SKILL.md\n",
+            encoding="utf-8")
+
+        # ① 分流判定
+        plan = build_plan(root, None, None, ["scripts/tool_ok.py", "README.md"])
+        chk("分流：标注头+登记指向工具仓 → 双属（进工具清单）",
+            plan["selftools"], ["scripts/tool_ok.py"])
+        chk("分流：本体清单为全量（含非自研文件）",
+            sorted(plan["ontology"]), ["README.md", "scripts/tool_ok.py"])
+
+        p2 = build_plan(root, None, None, ["scripts/orphan.py"])
+        chk("阴性对照：有标注头未登记 → FAIL 漏登记",
+            any(c[0] == "FAIL" and "漏登记" in c[2] for c in p2["checks"]), True)
+        chk("阴性对照：漏登记文件不静默进工具清单", p2["selftools"], [])
+
+        # ② 出站扫描前置 / 路径分类
+        p3 = build_plan(root, None, None, ["scripts/leak.py"])
+        chk("阴性对照：出站扫描命中本机主目录 → FAIL（阻塞两条通道）",
+            any(c[0] == "FAIL" and "主目录路径" in c[2] for c in p3["checks"]), True)
+
+        outside = str(root.parent / "outside_probe.py")
+        p5 = build_plan(root, None, None, [outside])
+        chk("路径分类：技能根外文件 → WARN 且不入本体清单",
+            (any(c[0] == "WARN" and "技能根之外" in c[2] for c in p5["checks"]),
+             p5["ontology"]), (True, []))
+
+        p4 = build_plan(root, None, None, ["SKILL.md"])
+        chk("分流：SKILL.md frontmatter 命中 → 只走本体，不进工具清单", p4["selftools"], [])
+        chk("交叉校验：登记链接指本体仓 → OK（不误报漏登记）",
+            any(c[0] == "OK" and c[1] == "SKILL.md" for c in p4["checks"]), True)
+
+        # ③ 推送清单结构与计数
+        lines: list[str] = []
+        n_fail = print_plan(plan, lines.append)
+        chk("推送清单：交叉校验失败数为 0", n_fail, 0)
+        chk("推送清单：本体通道行带计数",
+            any(("：%d 项（通道 push_ontology.py" % len(plan["ontology"])) in l for l in lines),
+            True)
+        chk("推送清单：自研工具通道行带计数",
+            any(("：%d 项（通道 publish_tools.py" % len(plan["selftools"])) in l for l in lines),
+            True)
+
+        # ④ 参数校验（互斥/必填）
+        argv = sys.argv
+        code = "no-exit"
+        try:
+            sys.argv = ["push_router.py", "classify"]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                main()
+        except SystemExit as e:
+            code = e.code
+        finally:
+            sys.argv = argv
+        chk("参数校验：classify 缺 --base/--head/--files → 退出码 2", code, 2)
+
+        # ⑤ fail-closed：--apply 在脏工作区必须拒绝，且一次通道都不调
+        subprocess.run(["git", "init", "-q"], cwd=td, capture_output=True)
+        calls: list[list[str]] = []
+        orig_run = globals()["run"]
+        globals()["run"] = lambda cmd: (calls.append(list(cmd)), 0)[1]
+        try:
+            ns = SimpleNamespace(root=str(root), base="HEAD~1", head="HEAD",
+                                 apply=True, allow_dirty=False, result_file=None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cmd_push(ns)
+        except Exception as e:  # noqa: BLE001 - 自检里任何异常都要落成 MISS，而不是崩掉
+            rc = "%s: %s" % (type(e).__name__, e)
+        finally:
+            globals()["run"] = orig_run
+        chk("阴性对照：--apply + 脏工作区 → 拒绝执行（rc=1）", rc, 1)
+        chk("fail-closed：拒绝时零通道调用（未触碰任何远端）", len(calls), 0)
+
+    print("=== selftest：%d/%d ===" % (ok_n, total))
+    return 0 if ok_n == total else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="push_router.py",
@@ -602,6 +751,13 @@ def main() -> int:
     pp.add_argument("--message", help="提交信息（透传给两条通道）")
     pp.add_argument("--result-file", help="输出落盘路径")
 
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检并退出（离线：分流判定 / 出站扫描前置 / 推送清单计数 / "
+                         "参数校验 / --apply 脏工作区拒绝）；不推送、不联网、不读凭据")
+    # 必须在 parse_args() 之前拦截：子命令是 required=True，先 parse 会直接退出 2。
+    # 只扫 argv，不改任何既有参数/默认值/退出码语义。
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
     a = ap.parse_args()
     if a.cmd == "classify":
         if not a.files and not (a.base and a.head):
