@@ -522,6 +522,114 @@ def selfcheck(base=DEFAULT_BASE):
     return 0 if ok else 2
 
 
+def _selftest() -> int:
+    """--selftest：只回归「不需要 Laya 服务在跑」的部分。
+
+    覆盖：questions 构造（含 thinking_judge 的下划线键剥离）、judge 名→model 钉死映射、
+    契约映射（含阴性：结构不合法必须拒绝）、回环代理绕过、不可达服务的 exit 3 降级。
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    global CONNECT_TIMEOUT, READ_TIMEOUT
+
+    results = []
+
+    def fmt(v):
+        if isinstance(v, (dict, list, tuple, set)):
+            return json.dumps(v, ensure_ascii=False, sort_keys=True, default=str)
+        return str(v)
+
+    def check(name, actual, expected):
+        ok = actual == expected
+        print(f"[{'PASS' if ok else 'MISS'}] {name}：实际={fmt(actual)} 期望={fmt(expected)}")
+        results.append(ok)
+
+    tpl = _load_templates()
+
+    # 1) self_judge questions = 模板 fixed 全量（7 题：category + D1–D5 + ambiguity）
+    qs = build_questions("self_judge")
+    check("build_questions(self_judge) 题数与键集合",
+          (len(qs), sorted(qs)), (7, sorted(tpl["self_judge"]["fixed"])))
+
+    # 2) thinking_judge：文档注释 `_note` / `_label` 不得被当成题目发给 Laya
+    qs_t = build_questions("thinking_judge")
+    check("build_questions(thinking_judge) 剥掉 _ 前缀键",
+          (any(str(k).startswith("_") for k in qs_t), "verdict_probe" in qs_t,
+           "_note" in json.dumps(qs_t, ensure_ascii=False)),
+          (False, True, False))
+
+    # 3) judge 名 → model 钉死（C20：这四类必须 multilingual，否则影子对照跑错模型）
+    check("PINNED_MODEL_BY_KIND 四类钉 multilingual、self_judge 不钉",
+          ({k: PINNED_MODEL_BY_KIND.get(k) for k in
+            ("method_judge", "retrieval_judge", "homework_judge", "thinking_judge", "self_judge")}),
+          {"method_judge": "multilingual", "retrieval_judge": "multilingual",
+           "homework_judge": "multilingual", "thinking_judge": "multilingual", "self_judge": None})
+
+    # 4) 契约映射：confidence=max(distribution)、top2 差 <0.15 出 secondary、distribution 归一
+    result = {
+        "answers": {
+            "category": {"type": "choice", "probabilities": {"code": 0.55, "chat": 0.45},
+                         "confidence": 0.02},
+            "ambiguity": {"type": "noul", "noul": 0.5},
+            "D1": {"type": "score", "score": 3}, "D2": {"type": "score", "score": 2},
+            "D3": {"type": "score", "score": 1}, "D4": {"type": "score", "score": 0},
+            "D5": {"type": "score", "score": 2},
+        },
+        "routing": {"model": "multilingual"}, "meta": {"latency_ms": 12.5},
+    }
+    out = map_self_judge(result, tpl)
+    check("map_self_judge 主类/置信/次标签/模糊/归一",
+          (out["category"], out["confidence"], out["secondary"], out["ambiguity"],
+           round(sum(out["distribution"].values()), 4), out["dimensions"].get("D1")),
+          ("code", 0.55, "chat", True, 1.0, 3.0))
+
+    # 5) 阴性：category 不是 choice 必须抛 LayaBadResponse（不得猜一个类别出来）
+    bad_type = {"answers": {"category": {"type": "score", "score": 2}}}
+    try:
+        map_self_judge(bad_type, tpl)
+        got5 = "未抛异常"
+    except LayaBadResponse:
+        got5 = "LayaBadResponse"
+    check("阴性：category 非 choice 被拒绝", got5, "LayaBadResponse")
+
+    # 6) 阴性：choice 但缺 probabilities 同样必须拒绝
+    bad_probs = {"answers": {"category": {"type": "choice"}}}
+    try:
+        map_self_judge(bad_probs, tpl)
+        got6 = "未抛异常"
+    except LayaBadResponse:
+        got6 = "LayaBadResponse"
+    check("阴性：缺 probabilities 被拒绝", got6, "LayaBadResponse")
+
+    # 7) 回环必须绕过环境代理（否则代理回 502 会被误判成"服务不可用"）
+    check("_opener 回环走 no-proxy、外网走默认",
+          (_opener("http://127.0.0.1:8731/healthz") is _NO_PROXY_OPENER,
+           _opener("http://localhost:8731/x") is _NO_PROXY_OPENER,
+           _opener("https://api.example.com/x") is not _NO_PROXY_OPENER),
+          (True, True, True))
+
+    # 8) 不可达 → 降级：127.0.0.1:1 必然拒绝连接，短超时保证秒回，契约 exit 3
+    old_c, old_r = CONNECT_TIMEOUT, READ_TIMEOUT
+    CONNECT_TIMEOUT = READ_TIMEOUT = 0.5
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            rc = main(["--judge", "self-judge", "--state", "帮我写个脚本合并这三份 CSV",
+                       "--base", "http://127.0.0.1:1"])
+    finally:
+        CONNECT_TIMEOUT, READ_TIMEOUT = old_c, old_r
+    line = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else "{}"
+    payload = json.loads(line)
+    check("不可达服务（127.0.0.1:1）→ exit 3 且 degraded=true",
+          (rc, payload.get("degraded")), (3, True))
+
+    total = len(results)
+    ok_n = sum(1 for r in results if r)
+    print(f"=== selftest：{ok_n}/{total} ===")
+    return 0 if ok_n == total else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Laya judge 客户端（契约映射 + 重试 + 降级）")
     ap.add_argument("--judge", choices=["self-judge", "method-judge", "retrieval-judge", "homework-judge",
@@ -533,7 +641,12 @@ def main(argv=None):
     ap.add_argument("--model", help="指定 checkpoint 名（english / multilingual）")
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="自检：回归 questions 构造/契约映射/降级码（不依赖服务，全过 exit 0）")
     args = ap.parse_args(argv)
+
+    if args.selftest:
+        return _selftest()
 
     if args.selfcheck:
         return selfcheck(args.base)
