@@ -45,7 +45,8 @@ blob sha 自证：本地侧内容一律从 `git cat-file blob <rev>:<path>` 取�
 
 网络口径：一律走 api.github.com（本机 github.com 主域间歇不通），用 `gh api` 子进程。
 凭据：沿用 `gh auth token`，本脚本不接触、不落盘、不打印令牌。
-退出码: 0 = 成功（含 dry-run 与幂等跳过）；1 = 有 FAIL；2 = 用法/环境错误
+退出码: 0 = 成功（含 dry-run 与幂等跳过）；1 = 有 FAIL；2 = 用法/前置错误；
+       3 = **无法判定**（外部不可用 / 能力缺失 —— 远端状态未知，不得记成「判不过」）
 """
 import argparse
 import base64
@@ -60,6 +61,16 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 DEFAULT_REPO = os.environ.get("ONTOLOGY_REPO", "Garvin666/ai-workflow-skill")
 DEFAULT_BRANCH = os.environ.get("ONTOLOGY_BRANCH", "main")
+
+
+class Undecided(RuntimeError):
+    """外部不可用 / 能力缺失 ⇒ **结论无法判定**（接口契约退出码 3）。
+
+    v4.44.0 立：此前网络抖一下（`TLS handshake timeout`）就抛 traceback、rc=1，
+    与「1 = 得出的结论是不通过」相撞 —— 推送根本没推成，却被记成「判不过」。
+    契约按**结论是否可得**分档，故这里必须与「判不过」区分开。
+    """
+
 
 
 def save_result(result_file: str | None, lines: list, root: Path) -> None:
@@ -120,7 +131,8 @@ def gh(method: str, api: str, body=None):
         inp = json.dumps(body).encode("utf-8")
     p = subprocess.run(cmd, capture_output=True, input=inp)
     if p.returncode != 0:
-        raise RuntimeError("%s %s\n%s" % (method, api, p.stderr.decode("utf-8", "replace")[:400]))
+        # 网络/鉴权/API 异常一律归「无法判定」：远端状态未知，不能说成「判不过」。
+        raise Undecided("%s %s\n%s" % (method, api, p.stderr.decode("utf-8", "replace")[:400]))
     return p.stdout.decode("utf-8")
 
 
@@ -148,6 +160,153 @@ def parse_name_status(raw: bytes):
     return writes, [d for d in deletes if d not in writes_set]
 
 
+# --------------------------------------------------------------------------- #
+# 自检（--selftest）：只跑**不产生外发动作**的判据
+# --------------------------------------------------------------------------- #
+def _st_line(name: str, actual, expect) -> bool:
+    hit = actual == expect
+    print("[%s] %s：实际=%s 期望=%s" % ("PASS" if hit else "MISS", name, actual, expect))
+    return hit
+
+
+def selftest() -> int:
+    """回归四条核心判据（全程离线，不建 blob / 不建 commit / 不改 ref）：
+
+      ① name-status 解析：`-z` 分隔、重命名拆成删旧+写新、删除项去重
+      ② dry-run 零写：无 `--apply` 时对远端只有 3 次 GET、POST 次数必须为 0
+         （这是 v3.4.0「blob 在 dry-run 也被 POST」缺陷的机器回归判据）
+      ③ 基线条短 sha 口径：≥7 位前缀通过、不符即 FAIL
+      ④ fail-closed：`--apply` + 基线不符 → rc=1 且**零 POST**（不能半推）
+
+    ⚠️ 远端一律由假 `gh` 顶替，且它只认上方列出的 3 个只读端点 —— 一旦代码路径走到
+       任何写端点，假 `gh` 直接判 MISS。本函数**不会**执行 git push，也不访问任何 remote。
+    """
+    import contextlib
+    import io
+    import tempfile
+
+    ok_n = total = 0
+
+    def chk(name: str, actual, expect) -> None:
+        nonlocal ok_n, total
+        total += 1
+        if _st_line(name, actual, expect):
+            ok_n += 1
+
+    # ---- ① name-status 解析 ----
+    w, d = parse_name_status(b"A\0a.py\0M\0b.py\0R100\0old.py\0new.py\0D\0c.py\0")
+    chk("name-status 解析：写入/删除分类（含重命名拆解）",
+        (w, d), (["a.py", "b.py", "new.py"], ["old.py", "c.py"]))
+    w2, d2 = parse_name_status(b"M\0d.py\0D\0d.py\0")
+    chk("name-status 解析：同一路径既写又删 → 删除项去重", (w2, d2), (["d.py"], []))
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def g(*args):
+            return subprocess.run(["git", "-c", "core.quotePath=false", *args],
+                                  cwd=str(root), capture_output=True)
+
+        # ---- 假 git 仓：git init + 本地两次 commit，**不设 remote、不 push** ----
+        init_ok = g("init", "-q").returncode == 0
+        chk("前置：临时 git 仓可建（不设 remote）", init_ok, True)
+        if not init_ok:
+            print("=== selftest：%d/%d ===" % (ok_n, total))
+            return 1 if ok_n != total else 0
+        for k, v in (("user.email", "selftest@example.invalid"), ("user.name", "selftest")):
+            g("config", k, v)
+        (root / "a.txt").write_text("A\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-qm", "c1")
+        (root / "a.txt").write_text("A2\n", encoding="utf-8")
+        (root / "b.txt").write_text("B\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-qm", "c2")
+
+        REMOTE = "a" * 40
+        calls: list[str] = []
+
+        def fake_gh(method: str, api: str, body=None):
+            calls.append(method)
+            if method == "GET" and api.endswith("/git/refs/heads/main"):
+                return json.dumps({"object": {"sha": REMOTE}})
+            if method == "GET" and "/git/commits/" in api:
+                return json.dumps({"tree": {"sha": "b" * 40}})
+            if method == "GET" and "/git/trees/" in api:
+                return json.dumps({"tree": [], "truncated": False})
+            raise AssertionError("selftest 出现预期外的远端调用（疑似写操作）：%s %s" % (method, api))
+
+        def run_main(*extra: str):
+            calls.clear()
+            argv = sys.argv
+            sys.argv = ["push_ontology.py", "--base", "HEAD~1", "--head", "HEAD",
+                        "--root", str(root), *extra]
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = main()
+            finally:
+                sys.argv = argv
+            return rc, buf.getvalue()
+
+        orig_gh = globals()["gh"]
+        globals()["gh"] = fake_gh
+        try:
+            rc1, _o1 = run_main()
+            chk("dry-run（无 --apply）退出码", rc1, 0)
+            chk("dry-run 远端读写比：只读 3 次", len(calls), 3)
+            chk("dry-run 绝不写远端：POST 次数", calls.count("POST"), 0)
+
+            rc2, o2 = run_main("--expect-remote", REMOTE[:7])
+            chk("基线条：≥7 位短 sha 前缀判通过", rc2, 0)
+            chk("基线条：短 sha 通过时明示前缀匹配", "短 sha 匹配通过" in o2, True)
+
+            rc3, _o3 = run_main("--expect-remote", "f" * 40)
+            chk("阴性对照：--expect-remote 不符 → FAIL（rc=1）", rc3, 1)
+            chk("阴性对照：基线不符时零 POST", calls.count("POST"), 0)
+
+            rc4, _o4 = run_main("--apply", "--expect-remote", "f" * 40)
+            chk("阴性对照：--apply + 基线不符 → 拒绝且零 POST",
+                (rc4, calls.count("POST")), (1, 0))
+
+            # ---- ⑤ 退出码契约（v4.44.0）：外部不可用 → 3；本地前置失败 → 2 ----
+            # 刻意走 `__main__` 用的同一条包装 run_cli()，而不是抽个纯映射函数来单测 ——
+            # 「映射写对了但没接线」是典型假绿（本技能既有教训）。
+            def run_cli_cap(*extra: str) -> tuple[int, str]:
+                calls.clear()
+                argv = sys.argv
+                sys.argv = ["push_ontology.py", "--base", "HEAD~1", "--head", "HEAD",
+                            "--root", str(root), *extra]
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        rc = run_cli()
+                finally:
+                    sys.argv = argv
+                return rc, err.getvalue()
+
+            def boom_undecided(method: str, api: str, body=None):
+                raise Undecided("模拟远端不可用（selftest）")
+
+            def boom_runtime(method: str, api: str, body=None):
+                raise RuntimeError("模拟本地前置失败（selftest）")
+
+            globals()["gh"] = boom_undecided
+            rc5, e5 = run_cli_cap()
+            chk("契约：外部不可用 → 退出码 3 且标注 UNDECIDED（不得记成判不过）",
+                (rc5, "UNDECIDED" in e5), (3, True))
+            chk("契约：外部不可用时零 POST", calls.count("POST"), 0)
+
+            globals()["gh"] = boom_runtime
+            rc6, e6 = run_cli_cap()
+            chk("契约：本地前置失败 → 退出码 2 且标注 USAGE", (rc6, "USAGE" in e6), (2, True))
+        finally:
+            globals()["gh"] = orig_gh
+
+    print("=== selftest：%d/%d ===" % (ok_n, total))
+    return 0 if ok_n == total else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="本体（技能本体 + 任务档案）增量推送通道 —— 默认 dry-run",
@@ -166,6 +325,13 @@ def main() -> int:
                          "v4.14.1 起接受 ≥7 位短 sha 前缀")
     ap.add_argument("--message", help="提交信息（默认取 --head 的提交信息）")
     ap.add_argument("--result-file", help="把摘要写入该文件（默认只打印）")
+    ap.add_argument("--selftest", action="store_true",
+                    help="运行内置自检并退出（离线：name-status 解析 / dry-run 零 POST / "
+                         "基线条短 sha 与 --apply 前置拒绝）；不推送、不联网、不读凭据")
+    # 必须在 parse_args() 之前拦截：--base/--head 是 required=True，先 parse 会因缺参
+    # 直接以退出码 2 结束，自检根本跑不到。只扫 argv，不改任何既有参数语义。
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
     a = ap.parse_args()
 
     root = find_root(a.root)
@@ -219,7 +385,7 @@ def main() -> int:
 
     tree = json.loads(gh("GET", "repos/%s/git/trees/%s?recursive=1" % (a.repo, base_tree)))
     if tree.get("truncated"):
-        raise RuntimeError("base_tree 被截断，需分页处理（本脚本未实现）")
+        raise Undecided("base_tree 被截断，需分页处理（本脚本未实现）⇒ 能力缺失，无法判定远端树")
     remote = {e["path"]: e["sha"] for e in tree["tree"] if e["type"] == "blob"}
     remote_shas = set(remote.values())
     out("远端 blob 路径 %d 个" % len(remote))
@@ -318,5 +484,24 @@ def main() -> int:
     return 0
 
 
+def run_cli() -> int:
+    """入口包装：把异常转成**契约退出码**，不再甩 traceback（§1 四码）。
+
+    为什么包在 main 外层而不是散在各处 try：`gh()` 深处任何一次网络抖动都要落同一条
+    映射，散着写必然漏一处；而漏掉的那处恰好是「最外层没人接」→ traceback。
+    """
+    try:
+        return main()
+    except Undecided as e:
+        print("[ERROR] %s" % e, file=sys.stderr)
+        print("[UNDECIDED] 远端状态未知（外部不可用/能力缺失）⇒ 按契约退出 3，"
+              "**不要**当成「判不过」", file=sys.stderr)
+        return 3
+    except RuntimeError as e:
+        print("[ERROR] %s" % e, file=sys.stderr)
+        print("[USAGE] 本地前置条件不满足（git/参数）⇒ 按契约退出 2", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli())
