@@ -4,7 +4,7 @@
 名称：total-agent
 用途：零依赖的多步骤任务总代理运行时（DAG 编排 + 状态持久化 + 人工门 + 结构化结果）。
 适用场景：长时多步实验流程的自主推进与断点续跑。
-仓库链接：待推送（https://github.com/Garvin666/ai-workflow-tools 预留）
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent
 
 错误分类决定后续动作：可重试 / 需人工 / 需终止。分类写在这里，不散落在捕获点。
 """
