@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 执行器层
 
 自研标识：Garvin666 自研工具 total-agent / 用途：把「一步做什么」落到真实动作 / 适用场景：shell 脚本与代码流程。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 四类执行器共用同一个返回结构 ExecResult，失败原因用 error_kind 归一化 ——
 上层只按 error_kind 决定重试/暂停/终止，不需要认识每种异常。
