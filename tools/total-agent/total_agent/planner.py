@@ -1,7 +1,7 @@
 """[自研工具] total-agent · DAG 编排
 
 自研标识：Garvin666 自研工具 total-agent / 用途：依赖解析与调度顺序 / 适用场景：多步骤有依赖的任务。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 四件事：校验计划、算拓扑序、算就绪集、算下游闭包。
 """
