@@ -1,0 +1,147 @@
+{
+  "name": "p07-round-pipeline",
+  "goal": "P7 本轮推进：VLA 栈自检 → 播种验收 → 基线链 / H2 链 / H3 链三条支线 → 各自汇总",
+  "inputs": {
+    "project": "projects/p07-failure-attribution",
+    "spec": "projects/p07-failure-attribution/README.md §2",
+    "model": ".envs/models/pi05_libero_v044",
+    "eval_tasks": [1, 2, 3],
+    "episodes_per_task": 27,
+    "total_episodes": 81
+  },
+  "constraints": [
+    "全程只用本机，不购置硬件 / 数据 / 云服务",
+    "batch_size=1、use_async_envs=False（按集播种的硬前置）",
+    "判据与评测集不得事后修改",
+    "n_episodes 是每任务集数，总数 = 3 × 27 = 81"
+  ],
+  "acceptance": [
+    "eval_info.json 落盘且三任务各 27 集",
+    "合并后总数 = 81，成功率落在官方 50-70% 区间",
+    "H2 三档与 H3 各出一份 results/*.md，含分层成功率与置信区间"
+  ],
+  "boundaries": {
+    "max_wall_seconds": 28800,
+    "max_steps": 40,
+    "max_total_attempts": 20,
+    "require_approval": false,
+    "allowed_commands": ["bash", "python", "git"]
+  },
+  "steps": [
+    {
+      "id": "01-stack-check",
+      "action": "VLA 栈自检（期望 20/20）",
+      "executor": "shell",
+      "command": "bash scripts/06-verify-vla-stack.sh",
+      "timeout_s": 900,
+      "max_attempts": 1,
+      "artifacts": ["outputs/eval/stack-check.log"],
+      "priority": 5
+    },
+    {
+      "id": "02-seed-verify",
+      "action": "按集播种验收（期望 42/42）",
+      "executor": "shell",
+      "command": "bash scripts/16-verify-episode-seed.sh",
+      "depends_on": ["01-stack-check"],
+      "timeout_s": 1800,
+      "max_attempts": 1,
+      "artifacts": ["outputs/eval/seed-verify.log"],
+      "priority": 9
+    },
+    {
+      "id": "03-baseline-eval",
+      "action": "基线 B0' 三任务各 27 集（约 95 min GPU）",
+      "executor": "shell",
+      "command": "bash scripts/17-run-baseline-batch.sh",
+      "depends_on": ["02-seed-verify"],
+      "timeout_s": 7200,
+      "max_attempts": 1,
+      "requires_approval": true,
+      "side_effects": true,
+      "question": "即将跑满 95 min GPU 并写入 outputs/eval/b0_*。确认开始？",
+      "artifacts": ["outputs/eval/b0_merged/eval_info.json"],
+      "priority": 10
+    },
+    {
+      "id": "04-merge-baseline",
+      "action": "合并三任务审计为单一基线",
+      "executor": "shell",
+      "command": "E:/envs/embodied/python.exe scripts/18-merge-baseline.py",
+      "depends_on": ["03-baseline-eval"],
+      "timeout_s": 600,
+      "max_attempts": 2,
+      "artifacts": ["outputs/eval/b0_merged/eval_info.json"],
+      "priority": 8
+    },
+    {
+      "id": "05-collect-baseline",
+      "action": "汇总基线指标与分层成功率",
+      "executor": "shell",
+      "command": "E:/envs/embodied/python.exe scripts/07-collect-baseline.py --info outputs/eval/b0_merged/eval_info.json",
+      "verify": "E:/envs/embodied/python.exe -c \"import json,sys;d=json.load(open('outputs/eval/b0_merged/eval_info.json',encoding='utf-8'));sys.exit(0 if d else 1)\"",
+      "depends_on": ["04-merge-baseline"],
+      "timeout_s": 600,
+      "max_attempts": 2,
+      "artifacts": ["projects/p07-failure-attribution/results/b0-prime-verification.md"],
+      "priority": 8
+    },
+    {
+      "id": "06-h2-verify",
+      "action": "H2 文本改写断言校验（28/28）",
+      "executor": "shell",
+      "command": "bash scripts/11-verify-h2-rewrite.sh",
+      "depends_on": ["02-seed-verify"],
+      "timeout_s": 900,
+      "max_attempts": 1,
+      "artifacts": ["outputs/eval/h2-verify.log"],
+      "priority": 6
+    },
+    {
+      "id": "07-h2-batch",
+      "action": "H2 三档批量评测（L1/L2/L3，约 289 min）",
+      "executor": "shell",
+      "command": "bash scripts/13-run-h2-batch.sh",
+      "depends_on": ["06-h2-verify"],
+      "timeout_s": 21600,
+      "max_attempts": 1,
+      "side_effects": true,
+      "artifacts": ["outputs/eval/h2_l1/eval_info.json"],
+      "priority": 3
+    },
+    {
+      "id": "08-h2-collect",
+      "action": "汇总 H2 三档与 McNemar 配对检验",
+      "executor": "shell",
+      "command": "E:/envs/embodied/python.exe scripts/14-collect-h2.py",
+      "depends_on": ["07-h2-batch"],
+      "timeout_s": 600,
+      "max_attempts": 2,
+      "artifacts": ["projects/p07-failure-attribution/results/h2-results.md"],
+      "priority": 6
+    },
+    {
+      "id": "09-h3-batch",
+      "action": "H3 加长步数档 episode_length=800（约 104 min）",
+      "executor": "shell",
+      "command": "bash scripts/20-run-h3-batch.sh",
+      "depends_on": ["02-seed-verify"],
+      "timeout_s": 21600,
+      "max_attempts": 1,
+      "side_effects": true,
+      "artifacts": ["outputs/eval/h3_s800/eval_info.json"],
+      "priority": 2
+    },
+    {
+      "id": "10-h3-collect",
+      "action": "汇总 H3 转化率（失败集转成功集数）",
+      "executor": "shell",
+      "command": "E:/envs/embodied/python.exe scripts/21-collect-h3.py",
+      "depends_on": ["09-h3-batch"],
+      "timeout_s": 600,
+      "max_attempts": 2,
+      "artifacts": ["projects/p07-failure-attribution/results/h3-results.md"],
+      "priority": 6
+    }
+  ]
+}
