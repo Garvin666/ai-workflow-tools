@@ -4,7 +4,7 @@
 名称：total-agent
 用途：零依赖的多步骤任务总代理运行时 —— DAG 编排、行为边界、崩溃恢复、人工确认、结构化结果。
 适用场景：长时多步骤实验/构建/数据处理流程的自主推进与断点续跑。
-仓库链接：待推送（预留 https://github.com/Garvin666/ai-workflow-tools）
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent（预留 https://github.com/Garvin666/ai-workflow-tools）
 
 最小用法：
     from total_agent import TaskSpec, RunStore, Policy, Boundaries, Runtime
