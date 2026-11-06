@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 数据模型与状态机
 
 自研标识：Garvin666 自研工具 total-agent / 用途：多步骤任务编排与恢复 / 适用场景：长时实验流程。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 状态迁移表是唯一口径源；任何模块改状态都必须走 transition()，不允许直接赋值。
 """
