@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 结构化结果
 
 自研标识：Garvin666 自研工具 total-agent / 用途：把运行状态压成交付可用结论 / 适用场景：任务收尾汇报。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 五个必填面与需求一一对应：最终产出 / 已完成步骤 / 未完成项 / 异常原因 / 后续建议。
 next_actions 由状态与错误码推导，不是套话模板 —— 每条都能指向一个具体动作。
