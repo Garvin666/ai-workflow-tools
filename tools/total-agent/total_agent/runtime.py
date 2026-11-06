@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 运行时主循环
 
 自研标识：Garvin666 自研工具 total-agent / 用途：调度-执行-验证-重试-暂停-终止 / 适用场景：自主推进多步任务。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 一轮循环做五件事：查预算 → 看是否已收口 → 消化审批 → 取一个就绪步 → 执行它。
 没有 ready 且没有 blocked，就是收口（或死锁）。这个判据只有一处，不在别处重复。
