@@ -131,4 +131,4 @@ total-agent/
 
 ---
 
-[自研工具] 名称：total-agent ｜ 用途：多步骤任务编排与恢复 ｜ 适用场景：长时实验/构建流程的自主推进 ｜ 仓库：待推送
+[自研工具] 名称：total-agent ｜ 用途：多步骤任务编排与恢复 ｜ 适用场景：长时实验/构建流程的自主推进 ｜ 仓库：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent
