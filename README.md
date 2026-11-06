@@ -91,6 +91,12 @@ ai-workflow 自研工具与技能的**公开留痕仓库**（源码同步 + 版�
 | weekly_digest.py | 把每日简报素材**蒸馏成周报**：汇总上周 7 天 `items.json` → 跨天去重 → 候选清单 → 模型精选 → 周报 MD/HTML/PDF + 领域笔记素材。两段式（`prepare` 出候选 / 渲染分离），脚本不做语义判断，「最有效」由模型判定。数据源是已落盘的 `items.json` 而非 RSS —— 故日链路不用改，且天然不丢数据 |
 | daily_clean.py | 知识库日清清洗：扫描检测 去重 / 死链 / 命名 / 无效残留 / 缺失字段 五类问题；把「白名单内的浏览器测试探针残留」移入**可还原隔离区**（仅移动、绝不删除）；产出中文日清报告与机器可读问题清单。三模式：`--report`（默认，零动作）/ `--apply`（移入隔离区）/ `--restore <manifest>`（还原）。工作区根走 `KB_ROOT` |
 
+**⑩ 任务编排运行时（具身智能工作区沉淀）**
+
+| 目录 | 用途 |
+| --- | --- |
+| tools/total-agent/ | 多步骤任务总代理：给一份 DAG 计划，它负责调度、行为边界、崩溃恢复、人工确认与结构化汇报。零第三方依赖（纯标准库），含 136 个单元测试、真实崩溃演练与可跑的示例计划（`examples/p07-pipeline.json`）。**核心结论**：可恢复性的关键是幂等键而非状态位 —— 状态位只回答「跑到哪了」，回答不了「外部世界被改了几次」；有副作用的步骤在「已开始未确认」时转人工确认，不自动重放 |
+
 ## 安装与使用
 
 ```bash
@@ -112,8 +118,11 @@ git clone https://github.com/Garvin666/ai-workflow-skill.git ~/.workbuddy/skills
 ai-workflow-tools/
 ├── README.md
 ├── scripts/          # 自研脚本（头部均有 [自研工具] 标注）
-└── skills/           # 独立自研技能（完整技能包：SKILL.md + scripts/ + references/ + assets/）
-    └── knowledge-cram-report/
+├── skills/           # 独立自研技能（完整技能包：SKILL.md + scripts/ + references/ + assets/）
+│   └── knowledge-cram-report/
+├── tasks/            # 自研任务的留痕与证据（判据、口径修复等）
+└── tools/            # 多文件自研工具（完整可运行包，非单文件脚本）
+    └── total-agent/  # 多步骤任务总代理：编排 / 边界 / 恢复 / 人工门 / 结构化结果
 ```
 
 ## 注意事项
