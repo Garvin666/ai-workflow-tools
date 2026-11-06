@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 行为边界
 
 自研标识：Garvin666 自研工具 total-agent / 用途：可配置的执行边界 / 适用场景：自主代理的失控防护。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 ⚠️ 如实标注：这不是安全沙箱。它挡的是「误操作」与「跑飞」，挡不住蓄意绕过
 （命令最终仍交给系统 shell）。真正的隔离要靠容器/账户权限，不在本模块射程内。
