@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 人工确认
 
 自研标识：Garvin666 自研工具 total-agent / 用途：阻塞时的人工介入协议 / 适用场景：需人拍板的步骤。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 协议是文件：approvals/<step>.json。写请求 -> 人改文件（或用 CLI）-> resume 读结论。
 刻意不接消息通道：谁来通知人不是编排内核的职责，接进来会把框架绑死在某个 IM 上。
