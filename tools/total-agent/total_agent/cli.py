@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 命令行入口
 
 自研标识：Garvin666 自研工具 total-agent / 用途：run/resume/status/approve/reject/report/validate
-适用场景：人机共同推进长时任务。仓库链接：待推送。
+适用场景：人机共同推进长时任务。仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 退出码按「结论是否可得」划分（与 ai-workflow 的接口契约同口径）：
   0 成功收口 / 2 暂停待人工（不是错误）/ 3 失败 / 4 中止 / 1 用法或输入错误
