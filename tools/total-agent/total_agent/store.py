@@ -1,7 +1,7 @@
 """[自研工具] total-agent · 持久化与恢复
 
 自研标识：Garvin666 自研工具 total-agent / 用途：状态落盘与崩溃恢复 / 适用场景：长时任务断点续跑。
-仓库链接：待推送。
+仓库链接：https://github.com/Garvin666/ai-workflow-tools/tree/main/tools/total-agent。
 
 两条铁律：
 1. journal.jsonl 是真相源，state.json 是缓存 —— 恢复时以前者校正后者。
