@@ -51,6 +51,11 @@ LAYER_DIR = {
     "交接": f"{WORK_LIB}/交接",
     "会话记忆": f"{USER_LIB}/会话记忆",
     "画像": f"{USER_LIB}/画像",
+    # 2026-10-27 补：以下三层 README 已登记为在用/按需层，但此前未进 LAYER_DIR，
+    # 导致 index 只扫「会话记忆／交接」⇒ 画像与经验沉淀静默不入索引。
+    "问答记忆": f"{USER_LIB}/问答记忆",
+    "经验沉淀": f"{WORK_LIB}/经验沉淀",
+    "场景": f"{WORK_LIB}/场景",
 }
 #: 2026-10-16 前平铺的存量，拆分后绝对路径为 用户记忆库/会话记忆/*.md
 LEGACY_DIR = f"{USER_LIB}/会话记忆"
@@ -119,11 +124,47 @@ def check_placeholders(text: str) -> list[str]:
     return [h for h in hits if not h.startswith("[[")][:5]
 
 
-def backup_file(p: Path) -> Path | None:
+#: 备份保留上限（2026-10-27 立）：同一原文件只留最近 BACKUP_KEEP 个备份。
+#: 此前无上限 ⇒ `00-记忆索引.md` 一日能堆 20+ 个、半年累积 168 个（10-27 已归档一批）。
+#: ⚠️ 只清理**本函数自己产出**的标准时间戳后缀 `.bak-\d{8}-\d{6}`；手工备份与
+#: 其它后缀（如 `.bak-before-v4.38.0-20261016`、`.bak-20261019-1720-场景前`）
+#: **一律不碰** —— 宁可留着堆，也不能删掉认不出的东西。
+BACKUP_KEEP = 5
+_BAK_TS_RE = re.compile(r"\.bak-\d{8}-\d{6}$")
+
+
+def _prune_backups(p: Path, keep: int) -> list[Path]:
+    """同一原文件只保留最近 `keep` 个标准 `.bak`，返回被删列表。`keep <= 0` 表示不清理。
+
+    排序按**文件名**而非 mtime：`.bak-YYYYMMDD-HHMMSS` 字典序即时间序，且复制/移动
+    不改文件名、会改 mtime ⇒ 按名字更可靠。
+    """
+    if keep <= 0:
+        return []
+    prefix = p.name + ".bak-"
+    cands: list[tuple[str, Path]] = []
+    for f in p.parent.iterdir():
+        if not f.is_file() or not f.name.startswith(prefix):
+            continue
+        if _BAK_TS_RE.search(f.name):
+            cands.append((f.name, f))
+    cands.sort(key=lambda t: t[0])
+    removed: list[Path] = []
+    for _, f in cands[:max(0, len(cands) - keep)]:
+        try:
+            f.unlink()
+            removed.append(f)
+        except OSError:
+            pass  # 删不掉（占用/只读）就留着，不阻断主流程
+    return removed
+
+
+def backup_file(p: Path, keep: int | None = None) -> Path | None:
     if not p.exists():
         return None
     b = p.with_name(f"{p.name}.bak-{ts()}")
     shutil.copy2(p, b)
+    _prune_backups(p, BACKUP_KEEP if keep is None else keep)
     return b
 
 
@@ -347,9 +388,9 @@ def cmd_place(args) -> int:
 
 
 def scan(root: Path) -> dict:
-    """扫描记忆库：两库分层新文件 ＋ 平铺存量。"""
-    out: dict = {"交接": {}, "会话记忆": {}, "存量平铺": []}
-    for kind_dir in ("交接", "会话记忆"):
+    """扫描记忆库：两库分层新文件 ＋ 画像（平铺、无项目层）＋ 平铺存量。"""
+    out: dict = {"交接": {}, "会话记忆": {}, "经验沉淀": {}, "画像": [], "存量平铺": []}
+    for kind_dir in ("交接", "会话记忆", "经验沉淀"):
         d = root / LAYER_DIR[kind_dir]
         if not d.is_dir():
             continue
@@ -358,6 +399,11 @@ def scan(root: Path) -> dict:
                            if ".bak" not in f.name)
             if files:
                 out[kind_dir][proj.name] = [f.name for f in files]
+    prof = root / LAYER_DIR["画像"]
+    if prof.is_dir():
+        # 画像没有项目子目录，直接平铺；README.md 不计入条目
+        out["画像"] = sorted(f.name for f in prof.glob("*.md")
+                             if ".bak" not in f.name and f.name != "README.md")
     legacy = root / LEGACY_DIR
     if legacy.is_dir():
         out["存量平铺"] = sorted(
@@ -409,10 +455,22 @@ def cmd_index(args) -> int:
         "> 分层规则：`<库>/<层>/<项目>/<日期>-<任务>.md`；项目名 = 任务工作区名；两库＝用户记忆库（记人）/ 工作记忆库（记活儿）。",
         "",
     ]
-    for lib, kinds in ((USER_LIB, ("会话记忆",)), (WORK_LIB, ("交接",))):
+    for lib, kinds in ((USER_LIB, ("画像", "会话记忆")), (WORK_LIB, ("交接", "经验沉淀"))):
         lines.append(f"## {lib}")
         lines.append("")
         for kind_dir in kinds:
+            if kind_dir == "画像":
+                # 画像层无项目子目录，单独渲染（2026-10-27 补，此前整层不入索引）
+                prof_files = data.get("画像", [])
+                if not prof_files:
+                    lines.extend((f"### 画像", "", "（暂无）", ""))
+                    continue
+                lines.extend((f"### 画像（{len(prof_files)}）", ""))
+                for f in prof_files:
+                    stem = f[:-3]
+                    lines.append(f"- [[{LAYER_DIR['画像']}/{stem}\\|{stem}]]")
+                lines.append("")
+                continue
             groups = data.get(kind_dir, {})
             if not groups:
                 lines.append(f"### {kind_dir}")
@@ -440,6 +498,8 @@ def cmd_index(args) -> int:
     if args.dry_run:
         print(f"[DRY] 索引将含：交接 {sum(len(v) for v in data.get('交接', {}).values())} 篇 ｜ "
               f"会话记忆 {sum(len(v) for v in data.get('会话记忆', {}).values())} 篇 ｜ "
+              f"经验沉淀 {sum(len(v) for v in data.get('经验沉淀', {}).values())} 篇 ｜ "
+              f"画像 {len(data.get('画像', []))} 篇 ｜ "
               f"存量 {len(legacy)} 篇")
         return 0
     dest = root / "00-记忆索引.md"
@@ -469,12 +529,18 @@ def cmd_stats(args) -> int:
                          if ln.strip().startswith("|") and "---" not in ln)
     profile_dir = root / LAYER_DIR["画像"]
     profile = list(profile_dir.glob("*.md")) if profile_dir.is_dir() else []
+    exp_n = sum(len(v) for v in data.get("经验沉淀", {}).values())
+    scene_dir = root / LAYER_DIR["场景"]
+    scene_n = (len([f for f in scene_dir.rglob("*.md") if f.name != "README.md"])
+               if scene_dir.is_dir() else 0)
     out = {
         "root": str(root),
         "库": {USER_LIB: ["会话记忆", "问答记忆", "画像"],
-               WORK_LIB: ["交接", "经验沉淀", "纠错账本"]},
+               WORK_LIB: ["交接", "场景", "经验沉淀", "纠错账本"]},
         "交接": {"projects": len(data.get("交接", {})), "files": handoff_n},
         "会话记忆": {"projects": len(data.get("会话记忆", {})), "files": memory_n},
+        "经验沉淀": {"projects": len(data.get("经验沉淀", {})), "files": exp_n},
+        "场景": {"files": scene_n},
         "存量平铺": legacy_n,
         "纠错账本": {"exists": correction.exists(), "table_rows": corr_lines},
         "画像": [p.name for p in profile],
@@ -851,12 +917,36 @@ def cmd_selftest(_args) -> int:
         if rc15 != 2:
             fails.append("fixture13 --kinds 越界必须 rc=2")
 
+        # fixture 19：备份保留策略 —— 只清「标准时间戳」，保留最近 N 个
+        bt = root / "bak-target.md"
+        bt.write_text("v1\n", encoding="utf-8")
+        for i, stamp in enumerate(("20260101-000000", "20260102-000000", "20260103-000000",
+                                   "20260104-000000", "20260105-000000", "20260106-000000")):
+            (root / f"bak-target.md.bak-{stamp}").write_text(f"old{i}\n", encoding="utf-8")
+        hand = root / "bak-target.md.bak-20260107-090000-手工"  # 非标准后缀：不得删
+        hand.write_text("manual\n", encoding="utf-8")
+        removed = _prune_backups(bt, 5)
+        if len(removed) != 1 or "20260101-000000" not in removed[0].name:
+            fails.append(f"fixture19 应只删最旧 1 个标准备份，实删 {[f.name for f in removed]}")
+        if not hand.exists():
+            fails.append("fixture19 非标准后缀（手工备份）不得被清理")
+        # 端到端：backup_file 自身也走保留策略（新建一个当前时间戳的备份 ⇒ 7 个标准里删 2）
+        backup_file(bt)
+        left = sorted(f.name for f in root.glob("bak-target.md.bak-*"))
+        if len(left) != 6:  # 5 标准 + 1 手工
+            fails.append(f"fixture19 backup_file 后应剩 5 标准 + 1 手工，实得 {left}")
+        if not any(".bak-" in n and n[-15:-9].isdigit() for n in left):
+            fails.append("fixture19 应保留最新时间戳的备份")
+        # keep<=0 ⇒ 不清理
+        if _prune_backups(bt, 0):
+            fails.append("fixture19 keep<=0 时必须不清理")
+
     if fails:
         print("[FAIL] selftest：")
         for f in fails:
             print(f"  - {f}")
         return 1
-    print("[OK] selftest 全绿（18 组 fixture：合法×3 / 阴性对照×2 / 幂等×3 / JSON×1 / "
+    print("[OK] selftest 全绿（19 组 fixture：合法×3 / 阴性对照×2 / 幂等×3 / JSON×1 / "
           "行尾保真×1(--no-fm) / 防重复 WARN×1 / 条目契约×3 / 写面守卫×1 / 空源与越界拒绝×1 / "
           "links 写入与拒收×2）")
     return 0
