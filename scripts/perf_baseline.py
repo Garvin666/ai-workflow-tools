@@ -380,6 +380,30 @@ def selftest() -> int:
     return 0 if ok == total else 1
 
 
+# 净耗时预算（建议 6／2026-11-25）。单位毫秒，均为**扣除解释器地板后的净开销**。
+# 依据：2026-11-25 实测 skill 净 1 779.6 ms、plan 净 562.5 ms；2026-09-16 的历史基线是
+# 129 / 92 ms，但检查项已从 12 涨到 92（7.7 倍），旧值已不可达，拿它当预算是刻舟求剑。
+# 取当前实测的 1.4–1.6 倍：项数再翻一倍时能提前出声，又不会被常态波动常亮。
+# ⚠️ 这是**告警线不是门禁**：超了只报 WARN，不阻断交付 —— 真正的刹车是「别再加检查项」。
+NET_BUDGET_MS = {"checks_skill": 2500.0, "checks_plan": 900.0}
+
+
+def check_budget(res: dict) -> list[dict]:
+    """按 NET_BUDGET_MS 判每条子命令的净开销。无采集数据判『未采集』，不当 0。"""
+    base = res.get("python_start_ms")
+    rows = []
+    for key, budget in NET_BUDGET_MS.items():
+        raw = res.get(f"{key}_ms")
+        if raw is None or base is None:
+            rows.append({"metric": key, "net_ms": None, "budget_ms": budget,
+                         "verdict": "未采集"})
+            continue
+        net = round(float(raw) - float(base), 1)
+        rows.append({"metric": key, "net_ms": net, "budget_ms": budget,
+                     "verdict": "OK" if net <= budget else "WARN"})
+    return rows
+
+
 def main() -> None:
     # `--selftest` 在 argparse 之前短路：`--label` 是 required，交给 argparse 会先因缺 --label 报错，
     # 从而改变既有「缺 --label ⇒ rc=2 + argparse 原始报错」的语义。故只认「作为参数出现」时不进解析。
@@ -389,6 +413,9 @@ def main() -> None:
     ap.add_argument("--label", required=True, help="本次标签，如 before / after")
     ap.add_argument("--out", default=".", help="JSON 落盘目录")
     ap.add_argument("--compare", help="与之对比的既有 JSON 路径")
+    ap.add_argument("--assert-budget", action="store_true",
+                    help="额外判定净耗时预算（NET_BUDGET_MS）：超预算报 WARN 并写入 JSON 的 "
+                         "budget 段；不影响既有输出格式与退出码")
     ap.add_argument("--selftest", action="store_true",
                     help="运行内置自检：只回归判据（id 抽取/取最小/环境一致性判定），不跑基线、不联网")
     args = ap.parse_args()
@@ -399,6 +426,16 @@ def main() -> None:
         pass
     res = measure(args.label)
     show(res)
+    if args.assert_budget:
+        rows = check_budget(res)
+        res["budget"] = rows
+        print("\n=== 净耗时预算（扣解释器地板；超线只 WARN，不阻断）===")
+        for r in rows:
+            if r["net_ms"] is None:
+                print(f"  {r['metric']}: 未采集 / 预算 {r['budget_ms']:.0f} ms")
+            else:
+                print(f"  {r['metric']}: 净 {r['net_ms']:.1f} ms / 预算 {r['budget_ms']:.0f} ms"
+                      f" -> {r['verdict']}")
     out = Path(args.out) / f"perf_baseline_{args.label}.json"
     out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[ OK ] 已写入 {out}")
